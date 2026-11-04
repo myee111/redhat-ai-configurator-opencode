@@ -1,0 +1,201 @@
+.TH REDHAT-AI-CONFIGURATOR 1 "October 2026" "redhat-ai-configurator 0.1.3" "User Commands"
+.SH NAME
+redhat-ai-configurator \- configure goose for Red Hat AI MaaS (rhai-maas) and EnMaaS
+.SH SYNOPSIS
+.B redhat-ai-configurator
+[\fIOPTIONS\fR]
+.SH DESCRIPTION
+.B redhat-ai-configurator
+configures the
+.BR goose (1)
+AI agent with the user's own Red Hat AI MaaS and EnMaaS API keys.
+Run it without arguments for the interactive terminal installer.
+.PP
+The tool validates each key against the service before writing anything,
+merges its settings into the existing goose configuration, and backs up every
+file it replaces. It never creates API keys: you create them in the browser.
+.PP
+Service endpoints are configured rather than embedded. Set them with
+\fB--rhai-maas-base-url\fR and \fB--enmaas-base-url\fR, in
+\fI/etc/redhat-ai-configurator/endpoints.conf\fR, or through the environment
+variables listed below. Flags win over the environment, which wins over the
+file. A fresh install uses placeholder example.com values and warns until they
+are replaced.
+.PP
+Red Hat AI MaaS needs the corporate VPN to be
+.BR off ;
+EnMaaS needs it
+.BR on .
+The installer shows which is required at each step.
+.SH OPTIONS
+.TP
+.B \-\-non-interactive
+Run without prompts. Implied by \fB--yes\fR, \fB--dry-run\fR and a non-TTY.
+.TP
+.BR \-y ", " \-\-yes
+Accept defaults without prompting.
+.TP
+.BI \-\-provider " ID"
+Providers to configure, comma separated: \fBrhai-maas\fR, \fBenmaas\fR.
+.TP
+.BI \-\-rhai-maas-base-url " URL"
+Base URL for \fBrhai-maas\fR, including \fB/v1\fR. Overrides the environment
+and \fIendpoints.conf\fR. Rejected unless it starts with \fBhttp://\fR or
+\fBhttps://\fR and ends with \fB/v1\fR.
+.TP
+.BI \-\-enmaas-base-url " URL"
+Base URL for \fBenmaas\fR, the host root without \fB/v1\fR. Overrides the
+environment and \fIendpoints.conf\fR. Rejected if it includes \fB/v1\fR.
+.TP
+.BI \-\-key-file " PATH"
+Read \fINAME=value\fR lines from PATH, or \fB-\fR for stdin. The file must be
+mode 0600 and owned by the invoking user. Recognised names are
+\fBRHAI_MAAS_API_KEY\fR and \fBENMAAS_API_KEY\fR.
+.TP
+.B \-\-keep-existing
+Reuse a key that is already stored instead of requiring it again.
+.TP
+.BI \-\-model " PROVIDER=MODEL"
+Set the default model, for example \fBenmaas=rits/zai-org/glm-5-3\fR.
+.TP
+.BI \-\-mode " MODE"
+goose tool mode: \fBauto\fR, \fBapprove\fR, \fBsmart_approve\fR or \fBchat\fR.
+The default is \fBapprove\fR.
+.TP
+.B \-\-keyring
+Store keys in the system keyring instead of \fBsecrets.yaml\fR.
+.TP
+.B \-\-no-validate
+Do not call the services to check keys. Useful for offline image builds.
+.TP
+.B \-\-require-validation
+Fail when a key could not be validated, for example on the wrong VPN. Also
+refuses to write a configuration whose selected provider still has a placeholder
+endpoint (exit 2).
+.TP
+.B \-\-no-verify
+Do not run \fBgoose info --check\fR afterwards.
+.TP
+.B \-\-rollback-on-failure
+Restore the previous configuration if verification fails.
+.TP
+.B \-\-dry-run
+Print what would change and exit without writing.
+.TP
+.BI \-\-format " text|json"
+Output format. JSON is intended for automation.
+.TP
+.BI \-\-config-dir " DIR"
+goose configuration directory. Default: \fB~/.config/goose\fR, or
+\fB$GOOSE_PATH_ROOT/config\fR when that variable is set.
+.TP
+.B \-\-doctor
+Check the current configuration without changing it.
+.TP
+.B \-\-list-models
+Print the models the service offers, then exit.
+.TP
+.B \-\-allow-root
+Permit running as root. Containers and image builds only.
+.SH ENVIRONMENT
+.TP
+.B RHAI_MAAS_API_KEY
+Red Hat AI MaaS API key.
+.TP
+.B ENMAAS_API_KEY
+EnMaaS API key. It also serves the \fBenmaas-openai\fR (Gemini) provider.
+.PP
+An environment key wins over the same name in \fB--key-file\fR; an unset or
+blank variable counts as absent. The interactive installer does not read these
+variables and asks for the key instead.
+.TP
+.B RHAI_MAAS_BASE_URL
+OpenAI-compatible base URL, including \fB/v1\fR.
+.TP
+.B ENMAAS_BASE_URL
+Anthropic-compatible root, without \fB/v1\fR (goose appends \fBv1/messages\fR).
+.PP
+\fB--rhai-maas-base-url\fR and \fB--enmaas-base-url\fR override these values.
+.TP
+.BR RHAI_MAAS_KEY_PAGE ", " RHAI_MAAS_HELP_URL
+Page for creating a key, and the help link shown in the UI.
+.TP
+.BR ENMAAS_KEY_PAGE ", " ENMAAS_HELP_URL
+Page for creating a key, and the help link shown in the UI.
+.TP
+.BR ENMAAS_ELIGIBILITY_URL ", " ENMAAS_SLACK
+Optional access-request page and help channel.
+.TP
+.B GOOSE_PATH_ROOT
+Relocates goose's configuration directory; useful in tests.
+.SH EXIT STATUS
+.TP
+.B 0
+Success, or a successful dry run.
+.TP
+.B 1
+Unexpected error.
+.TP
+.B 2
+Usage error: bad flag or base URL, placeholder endpoints with
+\fB--require-validation\fR, no provider, or no TTY without
+\fB--non-interactive\fR.
+.TP
+.B 3
+goose is missing or older than 1.38.
+.TP
+.B 4
+A key is missing, unreadable, or was rejected.
+.TP
+.B 5
+A service is unreachable (network or VPN).
+.TP
+.B 6
+A configuration file could not be written.
+.TP
+.B 7
+The configuration was written but \fBgoose info --check\fR failed.
+.SH FILES
+.TP
+.I /etc/redhat-ai-configurator/endpoints.conf
+Service endpoints. Flags and environment variables take precedence.
+.TP
+.I ~/.config/goose/config.yaml
+Provider, model and mode. Merged, backed up before writing.
+.TP
+.I ~/.config/goose/custom_providers/*.json
+Declarative provider definitions for rhai-maas, enmaas and enmaas-openai.
+.TP
+.I ~/.config/goose/secrets.yaml
+API keys, mode 0600, when file storage is selected.
+.SH EXAMPLES
+Configure both providers from environment variables:
+.PP
+.nf
+export RHAI_MAAS_API_KEY=...
+export ENMAAS_API_KEY=...
+redhat-ai-configurator --non-interactive --provider rhai-maas,enmaas
+.fi
+.PP
+Configure both providers without editing
+\fIendpoints.conf\fR or exporting base URLs (keys still come from the
+environment or \fB--key-file\fR):
+.PP
+.nf
+redhat-ai-configurator --non-interactive --provider rhai-maas,enmaas \\
+  --rhai-maas-base-url https://maas.example.com/v1 \\
+  --enmaas-base-url https://enmaas.example.com
+.fi
+.PP
+Read keys from stdin and emit machine-readable output:
+.PP
+.nf
+printf 'RHAI_MAAS_API_KEY=%s\\n' "$KEY" |
+  redhat-ai-configurator --non-interactive --provider rhai-maas \\
+  --key-file - --format json
+.fi
+.SH NOTES
+Run the tool as the user who will use goose, not as root. Keys are created by
+the user in the browser; the tool only validates and stores them.
+.SH SEE ALSO
+.BR goose (1)
