@@ -1,6 +1,6 @@
-# redhat-ai-configurator service endpoints
+# redhat-ai-configurator-opencode service endpoints
 #
-# Copy this file to /etc/redhat-ai-configurator/endpoints.conf and edit it, or
+# Copy this file to /etc/redhat-ai-configurator-opencode/endpoints.conf and edit it, or
 # set the same variables in the environment. Environment variables win.
 #
 # Only the base URL of each provider you configure is mandatory:
@@ -11,7 +11,7 @@
 #
 # RHAI_MAAS_BASE_URL is the OpenAI-compatible root and must include /v1.
 # ENMAAS_BASE_URL is the Anthropic-compatible root and must NOT include /v1;
-# goose appends v1/messages to it.
+# the installer appends /v1 for both EnMaaS provider entries.
 
 # --- Mandatory (for the provider you configure) ---------------------------------
 

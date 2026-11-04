@@ -55,7 +55,10 @@ pub fn read(path: &str) -> Result<Vec<KeyFileEntry>> {
     if path == "-" {
         let mut buf = String::new();
         io::stdin().read_to_string(&mut buf).map_err(|error| {
-            Fail::new(code::KEY, format!("Could not read keys from stdin: {error}"))
+            Fail::new(
+                code::KEY,
+                format!("Could not read keys from stdin: {error}"),
+            )
         })?;
         return parse(&buf);
     }
@@ -96,10 +99,9 @@ mod tests {
 
     #[test]
     fn parses_comments_blank_lines_and_wrapped_values() {
-        let entries = parse(
-            "# comment\n\nRHAI_MAAS_API_KEY=abc 123\nENMAAS_API_KEY=def\r\nUNRELATED=1\n",
-        )
-        .unwrap();
+        let entries =
+            parse("# comment\n\nRHAI_MAAS_API_KEY=abc 123\nENMAAS_API_KEY=def\r\nUNRELATED=1\n")
+                .unwrap();
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].name, "RHAI_MAAS_API_KEY");
         assert_eq!(entries[0].value, "abc123");

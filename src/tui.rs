@@ -13,15 +13,15 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Padding, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 
+use crate::agent::Agent;
 use crate::apply::{self, Selection};
 use crate::catalog::{self, ProviderSpec};
 use crate::error::{Fail, Result, code};
-use crate::goose::config::GooseMode;
-use crate::goose::runner;
-use crate::goose::secrets::{self, SecretsMode};
 use crate::netcheck::{self, Validation};
+use crate::opencode::auth;
+use crate::opencode::runner;
 use crate::output::{self, ProviderReport, Report};
-use crate::platform::GooseInfo;
+use crate::platform::ToolInfo;
 use crate::settings;
 
 const ACCENT: Color = Color::Rgb(238, 0, 0);
@@ -29,6 +29,7 @@ const OK: Color = Color::Rgb(90, 200, 130);
 const WARN: Color = Color::Rgb(230, 180, 70);
 const MUTED: Color = Color::Rgb(140, 140, 150);
 const TEXT: Color = Color::Rgb(215, 215, 220);
+const AUTH_LABEL: &str = "OpenCode credential store";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Screen {
@@ -134,8 +135,8 @@ impl ProviderUi {
 
 struct Review {
     providers: Vec<(String, String)>,
-    mode: String,
-    secrets: String,
+    agent: String,
+    auth: String,
     files: Vec<String>,
     warnings: Vec<String>,
     error: Option<String>,
@@ -155,7 +156,7 @@ enum Msg {
 
 struct App {
     config_dir: PathBuf,
-    goose: GooseInfo,
+    tool: ToolInfo,
     os: String,
     vpn: String,
     screen: Screen,
@@ -163,9 +164,8 @@ struct App {
     provider_cursor: usize,
     key_cursor: usize,
     settings_row: usize,
-    mode_index: usize,
-    secrets_mode: SecretsMode,
-    secrets_existing: BTreeSet<String>,
+    agent_index: usize,
+    credentials_existing: BTreeSet<String>,
     review: Option<Review>,
     done: Option<DoneInfo>,
     status_line: Option<(String, bool)>,
@@ -177,14 +177,18 @@ struct App {
 }
 
 impl App {
-    fn base(config_dir: PathBuf, goose: GooseInfo) -> Self {
+    fn base(config_dir: PathBuf, tool: ToolInfo) -> Self {
         let (tx, rx) = mpsc::channel();
         let os = crate::platform::os_pretty();
-        let secrets_existing = secrets::existing_names(&config_dir);
+        let credentials_existing = auth::stored(&tool.path)
+            .into_iter()
+            .filter(|(_, credential)| !credential.key.is_empty())
+            .map(|(integration, _)| integration)
+            .collect();
         let vpn = crate::platform::vpn_state().text();
         Self {
             config_dir,
-            goose,
+            tool,
             os,
             vpn,
             screen: Screen::Preflight,
@@ -192,9 +196,8 @@ impl App {
             provider_cursor: 0,
             key_cursor: 0,
             settings_row: 0,
-            mode_index: 0,
-            secrets_mode: SecretsMode::File,
-            secrets_existing,
+            agent_index: 0,
+            credentials_existing,
             review: None,
             done: None,
             status_line: None,
@@ -206,8 +209,8 @@ impl App {
         }
     }
 
-    fn new(config_dir: PathBuf, goose: GooseInfo) -> Self {
-        let app = Self::base(config_dir, goose);
+    fn new(config_dir: PathBuf, tool: ToolInfo) -> Self {
+        let app = Self::base(config_dir, tool);
         app.probe_reachability();
         app
     }
@@ -216,13 +219,13 @@ impl App {
     fn for_test(config_dir: PathBuf) -> Self {
         let mut app = Self::base(
             config_dir,
-            GooseInfo {
-                path: PathBuf::from("/usr/bin/goose"),
-                version: Some((1, 45, 0)),
-                raw_version: "1.45.0".into(),
+            ToolInfo {
+                path: PathBuf::from("/usr/local/bin/opencode"),
+                version: Some((2, 2, 5)),
+                raw_version: "opencode v2.2.5".into(),
             },
         );
-        app.secrets_existing = BTreeSet::new();
+        app.credentials_existing = BTreeSet::new();
         app
     }
 
@@ -268,22 +271,18 @@ impl App {
                 }
             }
             Msg::Applied(result, specs) => {
-                let (report, code) = match *result {
+                let (report, exit) = match *result {
                     Ok(report) => {
-                        let code = if report.ok { 0 } else { code::VERIFY };
-                        (report, code)
+                        let exit = if report.ok { 0 } else { code::VERIFY };
+                        (report, exit)
                     }
                     Err(fail) => {
                         let report = Report {
                             ok: false,
-                            goose_path: self.goose.path.display().to_string(),
-                            goose_version: self.goose.version_string(),
-                            config: self.config_dir.join("config.yaml").display().to_string(),
-                            secrets: self
-                                .config_dir
-                                .join("secrets.yaml")
-                                .display()
-                                .to_string(),
+                            binary_path: self.tool.path.display().to_string(),
+                            binary_version: self.tool.version_string(),
+                            config: apply::config_path(&self.config_dir).display().to_string(),
+                            auth: AUTH_LABEL.to_string(),
                             error: Some(fail.message.clone()),
                             error_code: Some(fail.code),
                             ..Report::default()
@@ -294,7 +293,7 @@ impl App {
                 self.done = Some(DoneInfo {
                     report,
                     specs,
-                    code,
+                    code: exit,
                 });
                 self.screen = Screen::Done;
             }
@@ -329,8 +328,7 @@ impl App {
                 }
                 KeyCode::Enter => {
                     if self.selected().is_empty() {
-                        self.status_line =
-                            Some(("Choose at least one provider.".into(), true));
+                        self.status_line = Some(("Choose at least one provider.".into(), true));
                     } else if let Some(first) = self.selected().first() {
                         self.key_cursor = self
                             .selected()
@@ -365,13 +363,15 @@ impl App {
         match key.code {
             KeyCode::Esc => self.screen = Screen::Providers,
             KeyCode::Tab | KeyCode::Down => {
-                if let Some(position) = selected.iter().position(|index| *index == self.key_cursor) {
+                if let Some(position) = selected.iter().position(|index| *index == self.key_cursor)
+                {
                     let next = (position + 1) % selected.len();
                     self.key_cursor = selected[next];
                 }
             }
             KeyCode::BackTab | KeyCode::Up => {
-                if let Some(position) = selected.iter().position(|index| *index == self.key_cursor) {
+                if let Some(position) = selected.iter().position(|index| *index == self.key_cursor)
+                {
                     let next = (position + selected.len() - 1) % selected.len();
                     self.key_cursor = selected[next];
                 }
@@ -415,7 +415,10 @@ impl App {
             return;
         };
         if provider.key_text.trim().is_empty() {
-            if self.secrets_existing.contains(provider.spec.secret) {
+            if self
+                .credentials_existing
+                .contains(provider.spec.default_provider)
+            {
                 provider.keep_existing = true;
                 provider.status = KeyStatus::Ok("using the key already stored".into());
                 self.advance_key();
@@ -453,7 +456,7 @@ impl App {
     }
 
     fn settings_rows(&self) -> usize {
-        self.selected().len() + 2
+        self.selected().len() + 1
     }
 
     fn handle_settings_key(&mut self, key: KeyEvent) {
@@ -476,14 +479,9 @@ impl App {
                         let next = (provider.model_index as i32 + delta).rem_euclid(count);
                         provider.model_index = next as usize;
                     }
-                } else if self.settings_row == providers {
-                    let count = GooseMode::ALL.len() as i32;
-                    self.mode_index = (self.mode_index as i32 + delta).rem_euclid(count) as usize;
                 } else {
-                    self.secrets_mode = match self.secrets_mode {
-                        SecretsMode::File => SecretsMode::Keyring,
-                        SecretsMode::Keyring => SecretsMode::File,
-                    };
+                    let count = Agent::ALL.len() as i32;
+                    self.agent_index = (self.agent_index as i32 + delta).rem_euclid(count) as usize;
                 }
             }
             KeyCode::Enter => {
@@ -504,10 +502,7 @@ impl App {
             if !provider.key_text.trim().is_empty() {
                 keys.push((provider.spec.secret.to_string(), provider.key_text.clone()));
             }
-            models.push((
-                provider.spec.id.to_string(),
-                provider.model().name.clone(),
-            ));
+            models.push((provider.spec.id.to_string(), provider.model().name.clone()));
         }
         Ok(Selection {
             provider_ids: selected
@@ -515,11 +510,11 @@ impl App {
                 .map(|index| self.providers[*index].spec.id)
                 .collect(),
             model_overrides: models,
-            mode: GooseMode::ALL[self.mode_index],
-            secrets_mode: self.secrets_mode,
+            agent: Agent::ALL[self.agent_index],
             keys,
             keep_existing: true,
             config_dir: self.config_dir.clone(),
+            opencode: self.tool.path.clone(),
         })
     }
 
@@ -530,21 +525,20 @@ impl App {
             .map(|index| {
                 let provider = &self.providers[*index];
                 (
-                    format!("{} ({})", provider.spec.display, provider.spec.id),
+                    format!("{} ({})", provider.spec.display, provider.spec.handle),
                     provider.model().name.clone(),
                 )
             })
             .collect();
 
-        match self.selection().and_then(|selection| apply::build(&selection)) {
+        match self
+            .selection()
+            .and_then(|selection| apply::build(&selection))
+        {
             Ok(plan) => Review {
                 providers,
-                mode: format!(
-                    "{} ({})",
-                    GooseMode::ALL[self.mode_index].as_str(),
-                    GooseMode::ALL[self.mode_index].label()
-                ),
-                secrets: plan.secrets_mode.label().to_string(),
+                agent: format!("{} ({})", plan.agent.as_str(), plan.agent.label()),
+                auth: AUTH_LABEL.to_string(),
                 files: plan
                     .changed
                     .iter()
@@ -555,8 +549,8 @@ impl App {
             },
             Err(fail) => Review {
                 providers,
-                mode: GooseMode::ALL[self.mode_index].as_str().to_string(),
-                secrets: self.secrets_mode.label().to_string(),
+                agent: Agent::ALL[self.agent_index].as_str().to_string(),
+                auth: AUTH_LABEL.to_string(),
                 files: Vec::new(),
                 warnings: Vec::new(),
                 error: Some(fail.message),
@@ -580,8 +574,7 @@ impl App {
             let status = match &provider.status {
                 KeyStatus::Ok(_) => Some(true),
                 KeyStatus::Warn(message) => {
-                    validation_warnings
-                        .push(format!("{}: {}", provider.spec.display, message));
+                    validation_warnings.push(format!("{}: {}", provider.spec.display, message));
                     None
                 }
                 KeyStatus::Err(_) => Some(false),
@@ -598,13 +591,13 @@ impl App {
             ));
         }
 
-        let goose = self.goose.clone();
+        let tool = self.tool.clone();
         let tx = self.tx.clone();
         self.applying_log = vec![
-            "Writing provider definitions".to_string(),
-            "Updating config.yaml".to_string(),
-            "Storing keys".to_string(),
-            "Verifying with goose info --check".to_string(),
+            "Writing opencode.json".to_string(),
+            "Storing keys with opencode auth import".to_string(),
+            "Setting the default model and agent".to_string(),
+            "Verifying with opencode models".to_string(),
         ];
         self.screen = Screen::Applying;
         self.spinner = 0;
@@ -617,11 +610,11 @@ impl App {
                 .collect();
             let result = (|| -> Result<Report> {
                 let plan = apply::build(&selection)?;
-                let commit = apply::commit(&plan, false)?;
+                let commit = apply::commit(&plan, &tool.path, false)?;
                 let mut report = Report {
                     ok: true,
-                    goose_path: goose.path.display().to_string(),
-                    goose_version: goose.version_string(),
+                    binary_path: tool.path.display().to_string(),
+                    binary_version: tool.version_string(),
                     providers: specs
                         .iter()
                         .map(|spec| ProviderReport {
@@ -644,14 +637,15 @@ impl App {
                                 .unwrap_or_else(|| "none".into()),
                         })
                         .collect(),
+                    agent: plan.agent.as_str().to_string(),
                     config: plan.config_path.display().to_string(),
                     backup: commit
                         .backups
                         .first()
                         .map(|backup| backup.path.display().to_string()),
-                    secrets: plan.secrets_path.display().to_string(),
-                    secrets_mode: plan.secrets_mode.label().to_string(),
-                    changed: !plan.changed.is_empty(),
+                    auth: AUTH_LABEL.to_string(),
+                    auth_updated: plan.auth_changed,
+                    changed: !plan.changed.is_empty() || plan.auth_changed,
                     changed_files: plan
                         .changed
                         .iter()
@@ -668,13 +662,12 @@ impl App {
                 };
                 report.warnings.dedup();
 
-                let check = runner::info_check(&goose.path);
+                let check = runner::models_check(&tool.path, &plan.model_refs);
                 report.verified = Some(check.ok);
                 report.verify_output = Some(check.output);
                 if !check.ok {
                     report.ok = false;
-                    report.error =
-                        Some("goose info --check failed after configuration.".to_string());
+                    report.error = Some("opencode models failed after configuration.".to_string());
                     report.error_code = Some(code::VERIFY);
                 }
                 Ok(report)
@@ -711,8 +704,8 @@ impl App {
     }
 }
 
-pub fn run(config_dir: PathBuf, goose: GooseInfo) -> Result<u8> {
-    let mut app = App::new(config_dir, goose);
+pub fn run(config_dir: PathBuf, tool: ToolInfo) -> Result<u8> {
+    let mut app = App::new(config_dir, tool);
     let mut terminal = ratatui::init();
     let outcome = app.event_loop(&mut terminal);
     ratatui::restore();
@@ -734,9 +727,12 @@ pub fn run(config_dir: PathBuf, goose: GooseInfo) -> Result<u8> {
 
 fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
-    let [header, body, footer] =
-        Layout::vertical([Constraint::Length(4), Constraint::Min(6), Constraint::Length(2)])
-            .areas(area);
+    let [header, body, footer] = Layout::vertical([
+        Constraint::Length(4),
+        Constraint::Min(6),
+        Constraint::Length(2),
+    ])
+    .areas(area);
 
     draw_header(frame, app, header);
     match app.screen {
@@ -752,7 +748,7 @@ fn draw(frame: &mut Frame, app: &App) {
 }
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
-    let steps = ["System", "Providers", "Keys", "Model", "Review"];
+    let steps = ["System", "Providers", "Keys", "Defaults", "Review"];
     let active = app.screen.step();
     let mut spans: Vec<Span<'static>> = Vec::new();
     for (index, step) in steps.iter().enumerate() {
@@ -771,11 +767,11 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
 
     let title = Line::from(vec![
         Span::styled(
-            " Red Hat AI Configurator",
+            " Red Hat AI Configurator for OpenCode",
             Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!("   goose {} · {}", app.goose.version_string(), app.os),
+            format!("   opencode {} · {}", app.tool.version_string(), app.os),
             Style::new().fg(MUTED),
         ),
     ]);
@@ -783,7 +779,10 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let text = Text::from(vec![
         title,
         Line::from(spans),
-        Line::from(Span::styled(separator, Style::new().fg(Color::Rgb(60, 60, 68)))),
+        Line::from(Span::styled(
+            separator,
+            Style::new().fg(Color::Rgb(60, 60, 68)),
+        )),
     ]);
     frame.render_widget(Paragraph::new(text), area);
 }
@@ -807,10 +806,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         lines.push(Line::from(""));
     }
-    lines.push(Line::from(Span::styled(
-        hints,
-        Style::new().fg(MUTED),
-    )));
+    lines.push(Line::from(Span::styled(hints, Style::new().fg(MUTED))));
     frame.render_widget(Paragraph::new(Text::from(lines)), area);
 }
 
@@ -821,7 +817,11 @@ fn render_card(
     lines: Vec<Line<'static>>,
     focused: bool,
 ) {
-    let colour = if focused { ACCENT } else { Color::Rgb(70, 70, 80) };
+    let colour = if focused {
+        ACCENT
+    } else {
+        Color::Rgb(70, 70, 80)
+    };
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(colour))
@@ -848,28 +848,31 @@ fn field(label: &str, value: impl Into<String>) -> Line<'static> {
 }
 
 fn draw_preflight(frame: &mut Frame, app: &App, area: Rect) {
-    let [system, goose_area, network] = Layout::vertical([
+    let [system, tool_area, network] = Layout::vertical([
         Constraint::Length(7),
         Constraint::Length(6),
         Constraint::Min(6),
     ])
     .areas(area);
 
-    let config_path = app.config_dir.join("config.yaml");
+    let config_path = apply::config_path(&app.config_dir);
     render_card(
         frame,
         system,
         "System",
         vec![
             field("os", app.os.clone()),
-            field("user", std::env::var("USER").unwrap_or_else(|_| "unknown".into())),
+            field(
+                "user",
+                std::env::var("USER").unwrap_or_else(|_| "unknown".into()),
+            ),
             field("config", app.config_dir.display().to_string()),
             field(
                 "existing",
                 if config_path.exists() {
-                    "config.yaml found (it will be backed up)"
+                    "opencode.json found (it will be backed up)"
                 } else {
-                    "no config.yaml yet"
+                    "no opencode.json yet"
                 },
             ),
             field("vpn", app.vpn.clone()),
@@ -877,21 +880,21 @@ fn draw_preflight(frame: &mut Frame, app: &App, area: Rect) {
         false,
     );
 
-    let goose_ok = app.goose.meets_min();
+    let tool_ok = app.tool.meets_min();
     render_card(
         frame,
-        goose_area,
-        "goose",
+        tool_area,
+        "OpenCode",
         vec![
-            field("binary", app.goose.path.display().to_string()),
-            field("version", app.goose.version_string()),
+            field("binary", app.tool.path.display().to_string()),
+            field("version", app.tool.version_string()),
             Line::from(Span::styled(
-                if goose_ok {
+                if tool_ok {
                     "✓ supported version"
                 } else {
-                    "✗ goose is too old; upgrade the goose package"
+                    "✗ OpenCode is too old; it will be upgraded before configuring"
                 },
-                Style::new().fg(if goose_ok { OK } else { ACCENT }),
+                Style::new().fg(if tool_ok { OK } else { ACCENT }),
             )),
         ],
         false,
@@ -968,9 +971,7 @@ fn draw_providers(frame: &mut Frame, app: &App, area: Rect) {
             ),
             Span::styled(
                 format!("{:<22}", provider.spec.display),
-                Style::new()
-                    .fg(TEXT)
-                    .add_modifier(Modifier::BOLD),
+                Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!("({})", provider.spec.handle),
@@ -1012,10 +1013,7 @@ fn draw_keys(frame: &mut Frame, app: &App, area: Rect) {
             KeyStatus::Idle => ("no key", MUTED),
         };
         lines.push(Line::from(vec![
-            Span::styled(
-                if focused { "▸ " } else { "  " },
-                Style::new().fg(ACCENT),
-            ),
+            Span::styled(if focused { "▸ " } else { "  " }, Style::new().fg(ACCENT)),
             Span::styled(
                 format!("{:<14}", provider.spec.display),
                 Style::new().fg(TEXT),
@@ -1037,9 +1035,10 @@ fn draw_keys(frame: &mut Frame, app: &App, area: Rect) {
             Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("Create or copy a key at:", Style::new().fg(MUTED)),
-        ]),
+        Line::from(Span::styled(
+            "Create or copy a key at:",
+            Style::new().fg(MUTED),
+        )),
         Line::from(Span::styled(
             format!("  {}", provider.spec.key_page()),
             Style::new().fg(ACCENT),
@@ -1076,7 +1075,10 @@ fn draw_keys(frame: &mut Frame, app: &App, area: Rect) {
 
     lines.push(Line::from(""));
     let masked = if provider.key_text.is_empty() {
-        if app.secrets_existing.contains(provider.spec.secret) {
+        if app
+            .credentials_existing
+            .contains(provider.spec.default_provider)
+        {
             "press enter to keep the stored key, or paste a new one".to_string()
         } else {
             "paste your key".to_string()
@@ -1131,10 +1133,7 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
         let focused = row == app.settings_row;
         let model = provider.model();
         lines.push(Line::from(vec![
-            Span::styled(
-                if focused { "▸ " } else { "  " },
-                Style::new().fg(ACCENT),
-            ),
+            Span::styled(if focused { "▸ " } else { "  " }, Style::new().fg(ACCENT)),
             Span::styled(
                 format!("{:<18}", provider.spec.display),
                 Style::new().fg(TEXT),
@@ -1160,14 +1159,11 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
     let providers = selected.len();
     let focused = app.settings_row == providers;
     lines.push(Line::from(vec![
-        Span::styled(
-            if focused { "▸ " } else { "  " },
-            Style::new().fg(ACCENT),
-        ),
-        Span::styled(format!("{:<18}", "goose mode"), Style::new().fg(TEXT)),
+        Span::styled(if focused { "▸ " } else { "  " }, Style::new().fg(ACCENT)),
+        Span::styled(format!("{:<18}", "default agent"), Style::new().fg(TEXT)),
         Span::styled("◀ ", Style::new().fg(MUTED)),
         Span::styled(
-            format!("{} ", GooseMode::ALL[app.mode_index].as_str()),
+            format!("{} ", Agent::ALL[app.agent_index].as_str()),
             Style::new().fg(if focused { ACCENT } else { TEXT }),
         ),
         Span::styled("▶", Style::new().fg(MUTED)),
@@ -1175,39 +1171,13 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
     lines.push(Line::from(vec![
         Span::styled("    ", Style::new()),
         Span::styled(
-            GooseMode::ALL[app.mode_index].label().to_string(),
+            Agent::ALL[app.agent_index].label().to_string(),
             Style::new().fg(MUTED),
         ),
     ]));
     lines.push(Line::from(""));
 
-    let focused = app.settings_row == providers + 1;
-    lines.push(Line::from(vec![
-        Span::styled(
-            if focused { "▸ " } else { "  " },
-            Style::new().fg(ACCENT),
-        ),
-        Span::styled(format!("{:<18}", "key storage"), Style::new().fg(TEXT)),
-        Span::styled("◀ ", Style::new().fg(MUTED)),
-        Span::styled(
-            format!("{} ", app.secrets_mode.label()),
-            Style::new().fg(if focused { ACCENT } else { TEXT }),
-        ),
-        Span::styled("▶", Style::new().fg(MUTED)),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("    ", Style::new()),
-        Span::styled(
-            if app.secrets_mode == SecretsMode::Keyring {
-                "needs secret-tool and an unlocked session keyring"
-            } else {
-                "plain file at ~/.config/goose/secrets.yaml, readable by you only"
-            },
-            Style::new().fg(MUTED),
-        ),
-    ]));
-
-    render_card(frame, area, "Default model and behaviour", lines, true);
+    render_card(frame, area, "Default models and agent", lines, true);
 }
 
 fn draw_review(frame: &mut Frame, app: &App, area: Rect) {
@@ -1245,9 +1215,12 @@ fn draw_review(frame: &mut Frame, app: &App, area: Rect) {
         ]));
     }
     lines.push(Line::from(""));
-    lines.push(field("mode", review.mode.clone()));
-    lines.push(field("keys", review.secrets.clone()));
-    lines.push(field("config", app.config_dir.display().to_string()));
+    lines.push(field("agent", review.agent.clone()));
+    lines.push(field("keys", review.auth.clone()));
+    lines.push(field(
+        "config",
+        apply::config_path(&app.config_dir).display().to_string(),
+    ));
     lines.push(Line::from(""));
     if review.files.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -1308,7 +1281,7 @@ fn draw_done(frame: &mut Frame, app: &App, area: Rect) {
         )));
     } else if report.verified == Some(false) {
         lines.push(Line::from(Span::styled(
-            "! Configuration written, but goose could not verify it",
+            "! Configuration written, but OpenCode could not verify it",
             Style::new().fg(WARN).add_modifier(Modifier::BOLD),
         )));
     } else {
@@ -1328,10 +1301,7 @@ fn draw_done(frame: &mut Frame, app: &App, area: Rect) {
     for provider in &report.providers {
         lines.push(Line::from(vec![
             Span::styled("● ", Style::new().fg(OK)),
-            Span::styled(
-                format!("{:<22}", provider.display),
-                Style::new().fg(TEXT),
-            ),
+            Span::styled(format!("{:<22}", provider.display), Style::new().fg(TEXT)),
             Span::styled(provider.model.clone(), Style::new().fg(MUTED)),
         ]));
     }
@@ -1341,12 +1311,21 @@ fn draw_done(frame: &mut Frame, app: &App, area: Rect) {
         lines.push(field("backup", backup.clone()));
     }
     lines.push(field(
-        "secrets",
-        format!("{} ({})", report.secrets, report.secrets_mode),
+        "keys",
+        format!(
+            "{} ({})",
+            report.auth,
+            if report.auth_updated {
+                "updated"
+            } else {
+                "unchanged"
+            }
+        ),
     ));
+    lines.push(field("agent", report.agent.clone()));
     match report.verified {
-        Some(true) => lines.push(field("verified", "goose info --check passed")),
-        Some(false) => lines.push(field("verified", "goose info --check failed")),
+        Some(true) => lines.push(field("verified", "opencode models passed")),
+        Some(false) => lines.push(field("verified", "opencode models failed")),
         None => {}
     }
     if let Some(output) = report
@@ -1370,7 +1349,7 @@ fn draw_done(frame: &mut Frame, app: &App, area: Rect) {
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "Press enter to close. Start the agent with: goose",
+        "Press enter to close. Start the agent with: opencode",
         Style::new().fg(MUTED),
     )));
 
@@ -1403,7 +1382,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let app = App::for_test(dir.path().to_path_buf());
         let screen = render(&app, 110, 34);
-        assert!(screen.contains("Red Hat AI Configurator"));
+        assert!(screen.contains("Red Hat AI Configurator for OpenCode"));
+        assert!(screen.contains("OpenCode"));
         assert!(screen.contains("Connectivity"));
         assert!(screen.contains("Red Hat AI MaaS"));
         assert!(screen.contains("EnMaaS"));
@@ -1425,14 +1405,14 @@ mod tests {
     }
 
     #[test]
-    fn settings_show_mode_and_storage() {
+    fn settings_show_models_and_agent() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = App::for_test(dir.path().to_path_buf());
         app.screen = Screen::Settings;
         let screen = render(&app, 110, 34);
-        assert!(screen.contains("goose mode"));
-        assert!(screen.contains("key storage"));
-        assert!(screen.contains("secrets.yaml"));
+        assert!(screen.contains("default agent"));
+        assert!(screen.contains("build"));
+        assert!(screen.contains("DeepSeek 4.1 Flash"));
     }
 
     #[test]
@@ -1451,7 +1431,7 @@ mod tests {
         app.done = Some(DoneInfo {
             report: Report {
                 ok: true,
-                config: "/tmp/config.yaml".into(),
+                config: "/tmp/opencode.json".into(),
                 ..Report::default()
             },
             specs: Vec::new(),

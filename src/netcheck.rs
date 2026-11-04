@@ -71,10 +71,7 @@ fn request_models(url: &str, key: &str, style: AuthStyle) -> Result<(u16, String
     match request.call() {
         Ok(mut response) => {
             let status = response.status().as_u16();
-            let body = response
-                .body_mut()
-                .read_to_string()
-                .unwrap_or_default();
+            let body = response.body_mut().read_to_string().unwrap_or_default();
             Ok((status, body))
         }
         Err(error) => Err(error.to_string()),
@@ -147,9 +144,16 @@ pub fn validate(url: &str, raw_key: &str) -> Validation {
     let status = *status;
 
     let message = match status {
-        401 => "That key was rejected. Check that you copied the whole key, or create a new one.".to_string(),
-        403 => "This key has no access to this service. Check your entitlement or create a new key.".to_string(),
-        404 => "The service did not recognise this endpoint. Check the VPN requirement for this step.".to_string(),
+        401 => "That key was rejected. Check that you copied the whole key, or create a new one."
+            .to_string(),
+        403 => {
+            "This key has no access to this service. Check your entitlement or create a new key."
+                .to_string()
+        }
+        404 => {
+            "The service did not recognise this endpoint. Check the VPN requirement for this step."
+                .to_string()
+        }
         status if status >= 500 => {
             let detail = body_snippet(body, &key);
             match detail {
@@ -161,7 +165,9 @@ pub fn validate(url: &str, raw_key: &str) -> Validation {
                 ),
             }
         }
-        status => format!("The service answered with HTTP {status}. Try again, or create a new key."),
+        status => {
+            format!("The service answered with HTTP {status}. Try again, or create a new key.")
+        }
     };
     Validation::fail(Some(status), message)
 }
@@ -175,7 +181,10 @@ fn body_snippet(body: &str, key: &str) -> Option<String> {
     }
     let limit = 300;
     if collapsed.chars().count() > limit {
-        Some(format!("{}…", collapsed.chars().take(limit).collect::<String>()))
+        Some(format!(
+            "{}…",
+            collapsed.chars().take(limit).collect::<String>()
+        ))
     } else {
         Some(collapsed)
     }
@@ -243,9 +252,7 @@ mod tests {
 
     type Paths = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
 
-    fn serve(
-        responses: Vec<(u16, &'static str)>,
-    ) -> (String, Paths, std::thread::JoinHandle<()>) {
+    fn serve(responses: Vec<(u16, &'static str)>) -> (String, Paths, std::thread::JoinHandle<()>) {
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
@@ -305,10 +312,8 @@ mod tests {
 
     #[test]
     fn retries_with_x_api_key_after_401() {
-        let (base, _paths, server) = serve(vec![
-            (401, ""),
-            (200, r#"{"models":[{"name":"claude"}]}"#),
-        ]);
+        let (base, _paths, server) =
+            serve(vec![(401, ""), (200, r#"{"models":[{"name":"claude"}]}"#)]);
         let result = validate(&base, "secret");
         server.join().unwrap();
         assert!(result.ok);

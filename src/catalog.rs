@@ -1,5 +1,6 @@
 //! The provider catalog: what the installer knows about the two MaaS
-//! services. Endpoints live in `settings` so this file contains no hostnames.
+//! services and how OpenCode should address them. Endpoints live in `settings`
+//! so this file contains no hostnames.
 
 use crate::settings;
 
@@ -10,10 +11,11 @@ pub enum Engine {
 }
 
 impl Engine {
-    pub fn as_str(self) -> &'static str {
+    /// Runtime package OpenCode loads for this API shape.
+    pub fn package(self) -> &'static str {
         match self {
-            Engine::OpenAi => "openai",
-            Engine::Anthropic => "anthropic",
+            Engine::OpenAi => "@opencode/ai/providers/openai-compatible",
+            Engine::Anthropic => "@opencode/ai/providers/anthropic",
         }
     }
 }
@@ -38,17 +40,21 @@ pub struct Model {
     /// Model name exactly as the service expects it.
     pub name: &'static str,
     pub display: &'static str,
-    /// Declarative provider that serves this model.
+    /// Provider entry that serves this model.
     pub provider: &'static str,
-    /// Required by goose for every model entry.
+    /// Context window written to the OpenCode model entry.
     pub context_limit: u64,
 }
 
+/// Output token ceiling written to every model entry. OpenCode uses it to
+/// budget a response; the services cap below it when their own limit is lower.
+pub const OUTPUT_LIMIT: u64 = 65_536;
+
 #[derive(Clone, Copy, Debug)]
 pub struct Declarative {
+    /// Provider ID in `opencode.json` and the prefix of every model reference.
     pub name: &'static str,
     pub display_name: &'static str,
-    pub description: &'static str,
     pub engine: Engine,
     /// Appended to the provider's configured base URL.
     pub base_suffix: &'static str,
@@ -57,49 +63,49 @@ pub struct Declarative {
 }
 
 impl Declarative {
+    /// The value written to `providers.<id>.settings.baseURL` and the root of
+    /// the key-validation request.
     pub fn base_url(&self) -> String {
         format!(
             "{}{}",
-            settings::endpoints().provider_base(self.name).trim_end_matches('/'),
+            settings::endpoints()
+                .provider_base(self.name)
+                .trim_end_matches('/'),
             self.base_suffix
         )
+    }
+
+    /// `GET` endpoint used to validate a key. Every supported API exposes its
+    /// model list beside the same `/v1` root the requests use.
+    pub fn validate_url(&self) -> String {
+        format!("{}/models", self.base_url().trim_end_matches('/'))
     }
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct ProviderSpec {
+    /// User-facing ID and CLI flag value (`rhai-maas`, `enmaas`).
     pub id: &'static str,
     pub display: &'static str,
-    /// Internal handle shown in the UI.
+    /// OpenCode provider ID shown in the configuration and model reference.
     pub handle: &'static str,
     pub vpn: VpnNeed,
-    /// Name of the secret goose looks up for this provider.
+    /// Environment variable that carries this provider's key.
     pub secret: &'static str,
     pub declaratives: &'static [Declarative],
     pub default_provider: &'static str,
     pub default_model: &'static str,
+    /// Which provider becomes the default when several are configured. EnMaaS
+    /// wins so DeepSeek 4.1 Flash is the first model.
+    pub priority: u8,
 }
 
 impl ProviderSpec {
-    /// Base URL of the provider's primary declarative entry.
-    pub fn base_url(&self) -> String {
+    pub fn validate_url(&self) -> String {
         self.declaratives
             .first()
-            .map(Declarative::base_url)
+            .map(Declarative::validate_url)
             .unwrap_or_default()
-    }
-
-    /// `GET` endpoint used to validate a key.
-    pub fn validate_url(&self) -> String {
-        let base = self.base_url();
-        let base = base.trim_end_matches('/');
-        if self.id == "rhai-maas" {
-            // The OpenAI base already ends in /v1.
-            format!("{base}/models")
-        } else {
-            // The Anthropic base is the host root; goose appends v1/messages.
-            format!("{base}/v1/models")
-        }
     }
 
     pub fn key_page(&self) -> String {
@@ -111,7 +117,9 @@ impl ProviderSpec {
     }
 
     pub fn eligibility_url(&self) -> Option<String> {
-        settings::endpoints().eligibility(self.id).map(str::to_string)
+        settings::endpoints()
+            .eligibility(self.id)
+            .map(str::to_string)
     }
 
     pub fn slack(&self) -> Option<String> {
@@ -123,51 +131,51 @@ const RHAI_MAAS_MODELS: &[Model] = &[
     Model {
         name: "publishers/prelude-maas/models/glm-53-flash",
         display: "GLM 5.3 Flash",
-        provider: "rhai-maas",
+        provider: "ai-bu",
         context_limit: 200_000,
     },
     Model {
         name: "publishers/prelude-maas/models/qwen38-27b",
         display: "Qwen 3.8 27B",
-        provider: "rhai-maas",
+        provider: "ai-bu",
         context_limit: 200_000,
     },
     Model {
         name: "publishers/prelude-maas/models/llama-4-scout-17b-16e-w4a16",
         display: "Llama 4 Scout 17B",
-        provider: "rhai-maas",
+        provider: "ai-bu",
         context_limit: 200_000,
     },
     Model {
         name: "publishers/prelude-maas/models/nemotron-cascade-2-30b",
         display: "Nemotron Cascade 2 30B",
-        provider: "rhai-maas",
+        provider: "ai-bu",
         context_limit: 200_000,
     },
     Model {
         name: "publishers/prelude-maas/models/gemma4",
         display: "Gemma 4",
-        provider: "rhai-maas",
+        provider: "ai-bu",
         context_limit: 200_000,
     },
     Model {
         name: "publishers/prelude-maas/models/llama-32-3b",
         display: "Llama 3.2 3B",
-        provider: "rhai-maas",
+        provider: "ai-bu",
         context_limit: 200_000,
     },
 ];
 
 const ENMAAS_MODELS: &[Model] = &[
     Model {
-        name: "rits/zai-org/glm-5-3",
-        display: "GLM 5.3",
+        name: "rits/deepseek-ai/DeepSeek-V4.1-Flash-1017",
+        display: "DeepSeek 4.1 Flash",
         provider: "enmaas",
         context_limit: 1_000_000,
     },
     Model {
-        name: "rits/deepseek-ai/DeepSeek-V4.1-Flash-1017",
-        display: "DeepSeek 4.1 Flash",
+        name: "rits/zai-org/glm-5-3",
+        display: "GLM 5.3",
         provider: "enmaas",
         context_limit: 1_000_000,
     },
@@ -225,33 +233,32 @@ const ENMAAS_OPENAI_MODELS: &[Model] = &[
     Model {
         name: "gemini-3.1-pro-preview",
         display: "Gemini 3.1 Pro",
-        provider: "enmaas-openai",
+        provider: "enmaas-oai",
         context_limit: 1_000_000,
     },
     Model {
         name: "gemini-3.8-flash",
         display: "Gemini 3.8 Flash",
-        provider: "enmaas-openai",
+        provider: "enmaas-oai",
         context_limit: 1_000_000,
     },
     Model {
         name: "gemini-3.7-flash",
         display: "Gemini 3.7 Flash",
-        provider: "enmaas-openai",
+        provider: "enmaas-oai",
         context_limit: 1_000_000,
     },
     Model {
         name: "gemini-3.6-flash",
         display: "Gemini 3.6 Flash",
-        provider: "enmaas-openai",
+        provider: "enmaas-oai",
         context_limit: 1_000_000,
     },
 ];
 
 const RHAI_MAAS_DECLARATIVES: &[Declarative] = &[Declarative {
-    name: "rhai-maas",
-    display_name: "Red Hat AI MaaS (rhai-maas)",
-    description: "Red Hat AI Model-as-a-Service, OpenAI compatible",
+    name: "ai-bu",
+    display_name: "Red Hat AI MaaS",
     engine: Engine::OpenAi,
     base_suffix: "",
     api_key_env: "RHAI_MAAS_API_KEY",
@@ -262,17 +269,15 @@ const ENMAAS_DECLARATIVES: &[Declarative] = &[
     Declarative {
         name: "enmaas",
         display_name: "EnMaaS",
-        description: "EnMaaS Anthropic-compatible endpoint",
         engine: Engine::Anthropic,
-        // goose joins "v1/messages" to this root, so no /v1 here.
-        base_suffix: "",
+        // The Anthropic runtime joins "/messages" to this base, so it needs /v1.
+        base_suffix: "/v1",
         api_key_env: "ENMAAS_API_KEY",
         models: ENMAAS_MODELS,
     },
     Declarative {
-        name: "enmaas-openai",
+        name: "enmaas-oai",
         display_name: "EnMaaS (OpenAI compatible)",
-        description: "EnMaaS OpenAI-compatible endpoint for Gemini models",
         engine: Engine::OpenAi,
         base_suffix: "/v1",
         api_key_env: "ENMAAS_API_KEY",
@@ -284,12 +289,13 @@ pub const PROVIDERS: &[ProviderSpec] = &[
     ProviderSpec {
         id: "rhai-maas",
         display: "Red Hat AI MaaS",
-        handle: "rhai-maas",
+        handle: "ai-bu",
         vpn: VpnNeed::Off,
         secret: "RHAI_MAAS_API_KEY",
         declaratives: RHAI_MAAS_DECLARATIVES,
-        default_provider: "rhai-maas",
+        default_provider: "ai-bu",
         default_model: "publishers/prelude-maas/models/glm-53-flash",
+        priority: 1,
     },
     ProviderSpec {
         id: "enmaas",
@@ -299,7 +305,8 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         secret: "ENMAAS_API_KEY",
         declaratives: ENMAAS_DECLARATIVES,
         default_provider: "enmaas",
-        default_model: "rits/zai-org/glm-5-3",
+        default_model: "rits/deepseek-ai/DeepSeek-V4.1-Flash-1017",
+        priority: 0,
     },
 ];
 
@@ -321,7 +328,7 @@ pub fn normalize_id(raw: &str) -> Option<&'static str> {
     }
 }
 
-/// Find the declarative provider and model entry for a chosen model name.
+/// Find the provider entry and model record for a chosen model name.
 pub fn resolve_model(
     spec: &ProviderSpec,
     model_name: &str,
@@ -332,6 +339,11 @@ pub fn resolve_model(
         }
     }
     None
+}
+
+/// Model reference OpenCode uses: `provider/model`.
+pub fn model_ref(provider: &str, model: &str) -> String {
+    format!("{provider}/{model}")
 }
 
 #[cfg(test)]
@@ -357,6 +369,16 @@ mod tests {
     }
 
     #[test]
+    fn enmaas_defaults_to_deepseek() {
+        let spec = find("enmaas").unwrap();
+        assert_eq!(
+            spec.default_model,
+            "rits/deepseek-ai/DeepSeek-V4.1-Flash-1017"
+        );
+        assert!(spec.priority < find("rhai-maas").unwrap().priority);
+    }
+
+    #[test]
     fn enmaas_shares_one_secret() {
         for d in find("enmaas").unwrap().declaratives {
             assert_eq!(d.api_key_env, "ENMAAS_API_KEY");
@@ -364,18 +386,20 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_shapes_are_correct() {
-        let rhai = find("rhai-maas").unwrap();
-        let enmaas = find("enmaas").unwrap();
-        assert!(rhai.base_url().ends_with("/v1"));
-        assert!(rhai.validate_url().ends_with("/v1/models"));
-        assert!(!enmaas.base_url().trim_end_matches('/').ends_with("/v1"));
-        assert!(enmaas.validate_url().ends_with("/v1/models"));
-        assert_eq!(
-            enmaas.declaratives[1].base_url(),
-            format!("{}/v1", enmaas.base_url().trim_end_matches('/'))
-        );
-        assert!(!rhai.key_page().is_empty());
-        assert!(!rhai.help_url().is_empty());
+    fn every_base_url_ends_with_v1_and_validates_beside_it() {
+        for spec in all() {
+            for declarative in spec.declaratives {
+                let base = declarative.base_url();
+                assert!(base.ends_with("/v1"), "{} base {base}", declarative.name);
+                assert_eq!(declarative.validate_url(), format!("{base}/models"));
+            }
+        }
+    }
+
+    #[test]
+    fn provider_ids_follow_the_opencode_names() {
+        assert_eq!(find("rhai-maas").unwrap().declaratives[0].name, "ai-bu");
+        assert_eq!(find("enmaas").unwrap().declaratives[0].name, "enmaas");
+        assert_eq!(find("enmaas").unwrap().declaratives[1].name, "enmaas-oai");
     }
 }

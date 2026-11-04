@@ -8,7 +8,7 @@ use std::fmt;
 pub mod code {
     pub const INTERNAL: u8 = 1;
     pub const USAGE: u8 = 2;
-    pub const GOOSE: u8 = 3;
+    pub const TOOL: u8 = 3;
     pub const KEY: u8 = 4;
     pub const NETWORK: u8 = 5;
     pub const WRITE: u8 = 6;

@@ -1,4 +1,4 @@
-NAME    := redhat-ai-configurator
+NAME    := redhat-ai-configurator-opencode
 VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 DIST    := dist
 TOP     := $(DIST)/rpmbuild

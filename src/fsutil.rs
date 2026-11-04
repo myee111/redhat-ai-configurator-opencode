@@ -45,15 +45,6 @@ pub fn backup(path: &Path) -> io::Result<Option<PathBuf>> {
     Ok(Some(candidate))
 }
 
-pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
-    fs::create_dir_all(dir)?;
-    let mode = fs::metadata(dir)?.permissions().mode() & 0o7777;
-    if mode != 0o700 {
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
-}
-
 pub fn is_private_file(path: &Path) -> io::Result<bool> {
     let meta = fs::metadata(path)?;
     Ok(meta.uid() == unsafe { libc::geteuid() } && meta.permissions().mode() & 0o077 == 0)

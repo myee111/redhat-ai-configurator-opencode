@@ -8,14 +8,14 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, ValueEnum};
 use serde_json::{Value, json};
 
+use crate::agent::Agent;
 use crate::apply::{self, Selection};
 use crate::catalog::{self, ProviderSpec};
 use crate::error::{Fail, Result, code};
-use crate::goose::config::GooseMode;
-use crate::goose::runner;
-use crate::goose::secrets::{self, SecretsMode};
 use crate::keyfile;
 use crate::netcheck;
+use crate::opencode::auth;
+use crate::opencode::runner;
 use crate::output::{ProviderReport, Report};
 use crate::platform;
 
@@ -27,12 +27,12 @@ pub enum Format {
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "redhat-ai-configurator",
+    name = "redhat-ai-configurator-opencode",
     version,
-    about = "Configure goose for Red Hat AI MaaS (rhai-maas) and EnMaaS",
-    long_about = "A guided installer that configures the goose AI agent with your own \
-Red Hat AI MaaS and EnMaaS API keys. Run without arguments for the TUI, or with \
---non-interactive for automation."
+    about = "Install and configure OpenCode for Red Hat AI MaaS (rhai-maas) and EnMaaS",
+    long_about = "A guided installer that installs the OpenCode CLI when it is missing and \
+configures it with your own Red Hat AI MaaS and EnMaaS API keys. Run without arguments for \
+the TUI, or with --non-interactive for automation."
 )]
 pub struct Args {
     /// Run without prompts. Implied by --yes, --dry-run and a non-TTY.
@@ -69,13 +69,17 @@ pub struct Args {
     #[arg(long, value_name = "PROVIDER=MODEL")]
     pub model: Vec<String>,
 
-    /// goose mode: auto, approve, smart_approve, chat.
-    #[arg(long, value_name = "MODE")]
-    pub mode: Option<String>,
+    /// Primary agent OpenCode starts with: build or plan.
+    #[arg(long, value_name = "AGENT")]
+    pub agent: Option<String>,
 
-    /// Store keys in the system keyring instead of secrets.yaml.
+    /// Install OpenCode into this directory when it is missing.
+    #[arg(long, value_name = "DIR")]
+    pub install_dir: Option<PathBuf>,
+
+    /// Never download OpenCode; fail when it is not installed.
     #[arg(long)]
-    pub keyring: bool,
+    pub no_install: bool,
 
     /// Do not call the services to check keys.
     #[arg(long)]
@@ -87,7 +91,7 @@ pub struct Args {
     #[arg(long)]
     pub require_validation: bool,
 
-    /// Do not run goose info --check afterwards.
+    /// Do not run `opencode models` afterwards.
     #[arg(long)]
     pub no_verify: bool,
 
@@ -102,7 +106,7 @@ pub struct Args {
     #[arg(long, value_enum, default_value_t = Format::Text)]
     pub format: Format,
 
-    /// goose configuration directory (default: ~/.config/goose).
+    /// OpenCode configuration directory (default: ~/.config/opencode).
     #[arg(long, value_name = "DIR")]
     pub config_dir: Option<PathBuf>,
 
@@ -127,9 +131,9 @@ pub fn run(args: Args) -> Result<u8> {
     if platform::is_root() && !args.allow_root {
         return Err(Fail::new(
             code::USAGE,
-            "Run this as the user who will use goose, not as root.",
+            "Run this as the user who will use OpenCode, not as root.",
         )
-        .hint("All goose configuration lives in that user's home directory."));
+        .hint("All OpenCode configuration lives in that user's home directory."));
     }
 
     if args.doctor {
@@ -150,12 +154,13 @@ pub fn run(args: Args) -> Result<u8> {
         .hint("Add --non-interactive (or --yes) when running from automation."));
     }
 
+    let tool = apply::preflight(args.install_dir.as_deref(), !args.no_install)?;
+
     if has_mode_flag || !tty {
-        return run_non_interactive(&args, &config_dir);
+        return run_non_interactive(&args, &config_dir, &tool.info);
     }
 
-    let goose = apply::preflight_goose()?;
-    crate::tui::run(config_dir, goose)
+    crate::tui::run(config_dir, tool.info)
 }
 
 /// Validate the base-URL flags and turn them into endpoint overrides. Flags are
@@ -196,14 +201,14 @@ fn endpoint_overrides(args: &Args) -> Result<BTreeMap<String, String>> {
         let value = value.trim_end_matches('/');
         if needs_v1 && !value.ends_with("/v1") {
             return Err(Fail::new(code::USAGE, format!("{flag} must include /v1."))
-                .hint("goose appends /chat/completions to an OpenAI-compatible base."));
+                .hint("OpenCode appends /chat/completions to an OpenAI-compatible base."));
         }
         if !needs_v1 && value.ends_with("/v1") {
             return Err(Fail::new(
                 code::USAGE,
                 format!("{flag} must be the host root, without /v1."),
             )
-            .hint("goose appends v1/messages; including /v1 would make it v1/v1/messages."));
+            .hint("This installer appends /v1 for EnMaaS; including it would double it."));
         }
         overrides.insert(key.to_string(), value.to_string());
     }
@@ -228,8 +233,9 @@ fn parse_providers(raw: &[String]) -> Result<Vec<&'static ProviderSpec>> {
         }
     }
     if out.is_empty() {
-        return Err(Fail::new(code::USAGE, "No provider selected.")
-            .hint("Use --provider rhai-maas,enmaas"));
+        return Err(
+            Fail::new(code::USAGE, "No provider selected.").hint("Use --provider rhai-maas,enmaas")
+        );
     }
     Ok(out)
 }
@@ -258,7 +264,10 @@ fn parse_models(raw: &[String]) -> Result<Vec<(String, String)>> {
                     })
                 })
                 .ok_or_else(|| {
-                    Fail::new(code::USAGE, format!("Unknown provider in model: {provider}"))
+                    Fail::new(
+                        code::USAGE,
+                        format!("Unknown provider in model: {provider}"),
+                    )
                 })?;
             out.push((id.to_string(), model.trim().to_string()));
         }
@@ -284,7 +293,9 @@ fn key_inputs(args: &Args, providers: &[&'static ProviderSpec]) -> Result<KeyInp
     let mut sources = BTreeMap::new();
 
     for spec in providers {
-        let from_env = std::env::var(spec.secret).ok().filter(|v| !v.trim().is_empty());
+        let from_env = std::env::var(spec.secret)
+            .ok()
+            .filter(|v| !v.trim().is_empty());
         if let Some(value) = from_env {
             keys.push((spec.secret.to_string(), value));
             sources.insert(spec.id.to_string(), "env".to_string());
@@ -309,8 +320,7 @@ fn key_inputs(args: &Args, providers: &[&'static ProviderSpec]) -> Result<KeyInp
     Ok((keys, sources, warnings))
 }
 
-fn run_non_interactive(args: &Args, config_dir: &Path) -> Result<u8> {
-    let goose = apply::preflight_goose()?;
+fn run_non_interactive(args: &Args, config_dir: &Path, tool: &platform::ToolInfo) -> Result<u8> {
     let providers = parse_providers(&args.provider)?;
     let (keys, sources, mut warnings) = key_inputs(args, &providers)?;
 
@@ -328,13 +338,13 @@ fn run_non_interactive(args: &Args, config_dir: &Path) -> Result<u8> {
             return Err(Fail::new(code::USAGE, message)
                 .hint(
                     "Set --rhai-maas-base-url and --enmaas-base-url, the matching environment \
-                     variables, or /etc/redhat-ai-configurator/endpoints.conf.",
+                     variables, or /etc/redhat-ai-configurator-opencode/endpoints.conf.",
                 )
                 .hint("Drop --require-validation to write the configuration anyway."));
         }
         warnings.push(format!(
             "{message} Set --rhai-maas-base-url / --enmaas-base-url, the matching environment \
-             variables, or /etc/redhat-ai-configurator/endpoints.conf."
+             variables, or /etc/redhat-ai-configurator-opencode/endpoints.conf."
         ));
     }
     for spec in &providers {
@@ -384,12 +394,11 @@ fn run_non_interactive(args: &Args, config_dir: &Path) -> Result<u8> {
                     .hint(format!("This step needs: {}", spec.vpn.text())));
                 }
             } else {
-                return Err(Fail::new(
-                    code::KEY,
-                    format!("{}: {}", spec.display, result.message),
-                )
-                .hint(format!("Create a new key at {}", spec.key_page()))
-                .hint(format!("This step needs: {}", spec.vpn.text())));
+                return Err(
+                    Fail::new(code::KEY, format!("{}: {}", spec.display, result.message))
+                        .hint(format!("Create a new key at {}", spec.key_page()))
+                        .hint(format!("This step needs: {}", spec.vpn.text())),
+                );
             }
         }
     } else {
@@ -398,26 +407,21 @@ fn run_non_interactive(args: &Args, config_dir: &Path) -> Result<u8> {
         }
     }
 
-    let mode = match &args.mode {
-        Some(raw) => GooseMode::parse(raw).ok_or_else(|| {
-            Fail::new(code::USAGE, format!("Unknown goose mode: {raw}"))
-                .hint("Use auto, approve, smart_approve, or chat.")
+    let agent = match &args.agent {
+        Some(raw) => Agent::parse(raw).ok_or_else(|| {
+            Fail::new(code::USAGE, format!("Unknown agent: {raw}")).hint("Use build or plan.")
         })?,
-        None => GooseMode::Approve,
+        None => Agent::Build,
     };
 
     let selection = Selection {
         provider_ids: providers.iter().map(|p| p.id).collect(),
         model_overrides: parse_models(&args.model)?,
-        mode,
-        secrets_mode: if args.keyring {
-            SecretsMode::Keyring
-        } else {
-            SecretsMode::File
-        },
+        agent,
         keys: keys.clone(),
         keep_existing: args.keep_existing,
         config_dir: config_dir.to_path_buf(),
+        opencode: tool.path.clone(),
     };
 
     let plan = apply::build(&selection)?;
@@ -435,30 +439,28 @@ fn run_non_interactive(args: &Args, config_dir: &Path) -> Result<u8> {
                 .map(|(_, model)| model.clone())
                 .unwrap_or_default(),
             validated: validated.get(spec.id).copied().flatten(),
-            key_source: sources
-                .get(spec.id)
-                .cloned()
-                .unwrap_or_else(|| {
-                    if plan.existing_keys.contains(spec.secret) {
-                        "existing".to_string()
-                    } else {
-                        "none".to_string()
-                    }
-                }),
+            key_source: sources.get(spec.id).cloned().unwrap_or_else(|| {
+                if plan.existing_keys.contains(spec.default_provider) {
+                    "existing".to_string()
+                } else {
+                    "none".to_string()
+                }
+            }),
         })
         .collect();
 
     let mut report = Report {
         ok: true,
         dry_run: args.dry_run,
-        goose_path: goose.path.display().to_string(),
-        goose_version: goose.version_string(),
+        binary_path: tool.path.display().to_string(),
+        binary_version: tool.version_string(),
         providers: provider_reports,
+        agent: plan.agent.as_str().to_string(),
         config: plan.config_path.display().to_string(),
         backup: None,
-        secrets: plan.secrets_path.display().to_string(),
-        secrets_mode: plan.secrets_mode.label().to_string(),
-        changed: !plan.changed.is_empty(),
+        auth: "OpenCode credential store".to_string(),
+        auth_updated: plan.auth_changed,
+        changed: !plan.changed.is_empty() || plan.auth_changed,
         changed_files: plan
             .changed
             .iter()
@@ -477,7 +479,7 @@ fn run_non_interactive(args: &Args, config_dir: &Path) -> Result<u8> {
         return Ok(0);
     }
 
-    let commit = match apply::commit(&plan, args.rollback_on_failure) {
+    let commit = match apply::commit(&plan, &tool.path, args.rollback_on_failure) {
         Ok(commit) => commit,
         Err(error) => {
             report.ok = false;
@@ -495,16 +497,18 @@ fn run_non_interactive(args: &Args, config_dir: &Path) -> Result<u8> {
     report.warnings = dedup(warnings);
 
     if !args.no_verify {
-        let check = runner::info_check(&goose.path);
+        let check = runner::models_check(&tool.path, &plan.model_refs);
         report.verified = Some(check.ok);
         report.verify_output = Some(check.output.clone());
         if !check.ok {
             if args.rollback_on_failure {
                 commit.restore();
-                report.warnings.push("Restored the previous configuration.".to_string());
+                report
+                    .warnings
+                    .push("Restored the previous configuration.".to_string());
             }
             report.ok = false;
-            report.error = Some("goose info --check failed after configuration.".to_string());
+            report.error = Some("opencode models failed after configuration.".to_string());
             report.error_code = Some(code::VERIFY);
             emit(&report, args.format);
             return Ok(code::VERIFY);
@@ -552,8 +556,10 @@ fn run_list_models(args: &Args) -> Result<u8> {
             } else {
                 code::KEY
             };
-            return Err(Fail::new(code, format!("{}: {}", spec.display, result.message))
-                .hint(format!("This step needs: {}", spec.vpn.text())));
+            return Err(
+                Fail::new(code, format!("{}: {}", spec.display, result.message))
+                    .hint(format!("This step needs: {}", spec.vpn.text())),
+            );
         }
         all.push(json!({ "provider": spec.id, "models": result.models }));
     }
@@ -563,7 +569,10 @@ fn run_list_models(args: &Args) -> Result<u8> {
         } else {
             Value::Array(all)
         };
-        println!("{}", serde_json::to_string_pretty(&value).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).unwrap_or_default()
+        );
     } else {
         for entry in &all {
             println!(
@@ -580,29 +589,25 @@ fn run_list_models(args: &Args) -> Result<u8> {
     Ok(0)
 }
 
-/// Providers a goose config actually references: the active provider plus any
-/// entries in the structured `providers:` block. Declarative names such as
-/// `enmaas-openai` are mapped back to their parent provider.
+/// Providers an OpenCode config actually references: the default model's
+/// provider plus every provider entry this catalog knows. IDs such as
+/// `enmaas-oai` map back to their parent provider.
 fn configured_provider_ids(config_text: Option<&str>) -> Vec<&'static str> {
     let Some(text) = config_text else {
         return Vec::new();
     };
-    let Ok(value) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(text) else {
+    let Ok(root) = crate::opencode::config::parse(text) else {
         return Vec::new();
     };
 
     let mut names: Vec<String> = Vec::new();
-    for key in ["GOOSE_PROVIDER", "active_provider"] {
-        if let Some(name) = value.get(key).and_then(|value| value.as_str()) {
-            names.push(name.to_string());
-        }
+    if let Some(model) = root.get("model").and_then(Value::as_str)
+        && let Some((provider, _)) = model.split_once('/')
+    {
+        names.push(provider.to_string());
     }
-    if let Some(serde_yaml_ng::Value::Mapping(providers)) = value.get("providers") {
-        for key in providers.keys() {
-            if let Some(name) = key.as_str() {
-                names.push(name.to_string());
-            }
-        }
+    if let Some(providers) = root.get("providers").and_then(Value::as_object) {
+        names.extend(providers.keys().cloned());
     }
 
     let mut ids: Vec<&'static str> = Vec::new();
@@ -637,23 +642,23 @@ fn run_doctor(config_dir: &Path, format: Format) -> Result<u8> {
         name: "user".into(),
         ok: !platform::is_root(),
         detail: if platform::is_root() {
-            "running as root; goose config is per-user".into()
+            "running as root; OpenCode config is per-user".into()
         } else {
             "non-root".into()
         },
     });
 
-    let goose = platform::goose_info();
+    let tool = platform::opencode_info();
     checks.push(CheckItem {
-        name: "goose".into(),
-        ok: goose.as_ref().is_some_and(|g| g.meets_min()),
-        detail: match &goose {
-            Some(g) => format!("{} at {}", g.version_string(), g.path.display()),
+        name: "opencode".into(),
+        ok: tool.as_ref().is_some_and(|t| t.meets_min()),
+        detail: match &tool {
+            Some(t) => format!("{} at {}", t.version_string(), t.path.display()),
             None => "not found on PATH".into(),
         },
     });
 
-    let config_path = config_dir.join("config.yaml");
+    let config_path = apply::config_path(config_dir);
     let config_text = std::fs::read_to_string(&config_path).ok();
     checks.push(CheckItem {
         name: "config".into(),
@@ -665,31 +670,36 @@ fn run_doctor(config_dir: &Path, format: Format) -> Result<u8> {
         },
     });
 
-    let (provider, model) = config_text
+    let root = config_text
         .as_deref()
-        .and_then(|text| serde_yaml_ng::from_str::<serde_yaml_ng::Value>(text).ok())
-        .map(|value| {
-            let get = |key: &str| {
-                value
-                    .get(key)
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string()
-            };
-            let mut provider = get("GOOSE_PROVIDER");
-            if provider.is_empty() {
-                provider = get("active_provider");
-            }
-            (provider, get("GOOSE_MODEL"))
-        })
+        .and_then(|text| crate::opencode::config::parse(text).ok())
         .unwrap_or_default();
+    let model = root
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let agent = root
+        .get("default_agent")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     checks.push(CheckItem {
-        name: "provider".into(),
-        ok: !provider.is_empty() && !model.is_empty(),
-        detail: if provider.is_empty() {
-            "no provider selected".into()
+        name: "model".into(),
+        ok: !model.is_empty(),
+        detail: if model.is_empty() {
+            "no default model".into()
         } else {
-            format!("{provider} / {model}")
+            model.clone()
+        },
+    });
+    checks.push(CheckItem {
+        name: "agent".into(),
+        ok: !agent.is_empty(),
+        detail: if agent.is_empty() {
+            "no default agent".into()
+        } else {
+            agent
         },
     });
 
@@ -697,19 +707,21 @@ fn run_doctor(config_dir: &Path, format: Format) -> Result<u8> {
     let checked: Vec<&'static ProviderSpec> = if configured.is_empty() {
         catalog::all().iter().collect()
     } else {
-        configured.iter().filter_map(|id| catalog::find(id)).collect()
+        configured
+            .iter()
+            .filter_map(|id| catalog::find(id))
+            .collect()
     };
 
-    for declarative in checked.iter().flat_map(|spec| spec.declaratives) {
-        let path = config_dir
-            .join("custom_providers")
-            .join(format!("{}.json", declarative.name));
-        checks.push(CheckItem {
-            name: format!("provider file {}", declarative.name),
-            ok: path.exists(),
-            detail: path.display().to_string(),
-        });
-    }
+    checks.push(CheckItem {
+        name: "providers".into(),
+        ok: !configured.is_empty(),
+        detail: if configured.is_empty() {
+            "no provider entries".into()
+        } else {
+            configured.join(", ")
+        },
+    });
 
     let endpoints = crate::settings::endpoints();
     checks.push(CheckItem {
@@ -722,17 +734,24 @@ fn run_doctor(config_dir: &Path, format: Format) -> Result<u8> {
             .join(" / "),
     });
 
-    let stored = secrets::existing_names(config_dir);
-    for spec in &checked {
-        checks.push(CheckItem {
-            name: format!("key {}", spec.id),
-            ok: stored.contains(spec.secret),
-            detail: if stored.contains(spec.secret) {
-                "stored".into()
-            } else {
-                "not stored".into()
-            },
-        });
+    if let Some(tool) = &tool {
+        let stored = auth::stored(&tool.path);
+        for spec in &checked {
+            checks.push(CheckItem {
+                name: format!("key {}", spec.id),
+                ok: stored
+                    .get(spec.default_provider)
+                    .is_some_and(|credential| !credential.key.is_empty()),
+                detail: if stored
+                    .get(spec.default_provider)
+                    .is_some_and(|credential| !credential.key.is_empty())
+                {
+                    "stored".into()
+                } else {
+                    "not stored".into()
+                },
+            });
+        }
     }
 
     for spec in &checked {
@@ -757,9 +776,12 @@ fn run_doctor(config_dir: &Path, format: Format) -> Result<u8> {
                 "name": c.name, "ok": c.ok, "detail": c.detail
             })).collect::<Vec<_>>(),
         });
-        println!("{}", serde_json::to_string_pretty(&value).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).unwrap_or_default()
+        );
     } else {
-        println!("goose configuration in {}", config_dir.display());
+        println!("OpenCode configuration in {}", config_dir.display());
         println!();
         for check in &checks {
             println!(
@@ -770,7 +792,14 @@ fn run_doctor(config_dir: &Path, format: Format) -> Result<u8> {
             );
         }
         println!();
-        println!("{}", if ok { "All checks passed." } else { "Some checks failed." });
+        println!(
+            "{}",
+            if ok {
+                "All checks passed."
+            } else {
+                "Some checks failed."
+            }
+        );
     }
     Ok(if ok { 0 } else { 1 })
 }
@@ -780,8 +809,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn configured_ids_include_flat_and_structured_names() {
-        let text = "GOOSE_PROVIDER: rhai-maas\nactive_provider: enmaas\nproviders:\n  enmaas-openai:\n    enabled: true\n";
+    fn configured_ids_come_from_model_and_providers() {
+        let text = r#"{
+          "model": "enmaas/rits/deepseek-ai/DeepSeek-V4.1-Flash-1017",
+          "providers": { "ai-bu": {}, "enmaas": {}, "enmaas-oai": {} }
+        }"#;
         let ids = configured_provider_ids(Some(text));
         assert!(ids.contains(&"rhai-maas"));
         assert!(ids.contains(&"enmaas"));
@@ -789,15 +821,15 @@ mod tests {
     }
 
     #[test]
-    fn configured_ids_map_declarative_names_to_providers() {
-        let ids = configured_provider_ids(Some("active_provider: enmaas-openai\n"));
+    fn configured_ids_map_opencode_names_to_providers() {
+        let ids = configured_provider_ids(Some(r#"{"providers":{"enmaas-oai":{}}}"#));
         assert_eq!(ids, vec!["enmaas"]);
     }
 
     #[test]
     fn configured_ids_empty_without_a_provider() {
         assert!(configured_provider_ids(None).is_empty());
-        assert!(configured_provider_ids(Some("GOOSE_MODEL: some-model\n")).is_empty());
-        assert!(configured_provider_ids(Some("providers: [unclosed\n")).is_empty());
+        assert!(configured_provider_ids(Some(r#"{"model": "x"}"#)).is_empty());
+        assert!(configured_provider_ids(Some("{ unclosed")).is_empty());
     }
 }

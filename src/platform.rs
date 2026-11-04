@@ -1,20 +1,20 @@
-//! Host discovery: OS, privileges, goose installation and config paths.
+//! Host discovery: OS, privileges, the OpenCode CLI and config paths.
 
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub const MIN_GOOSE: (u32, u32, u32) = (1, 38, 0);
+pub const MIN_OPENCODE: (u32, u32, u32) = (2, 0, 0);
 
 #[derive(Clone, Debug)]
-pub struct GooseInfo {
+pub struct ToolInfo {
     pub path: PathBuf,
     pub version: Option<(u32, u32, u32)>,
     pub raw_version: String,
 }
 
-impl GooseInfo {
+impl ToolInfo {
     pub fn version_string(&self) -> String {
         match self.version {
             Some((a, b, c)) => format!("{a}.{b}.{c}"),
@@ -24,7 +24,7 @@ impl GooseInfo {
 
     pub fn meets_min(&self) -> bool {
         match self.version {
-            Some(v) => v >= MIN_GOOSE,
+            Some(v) => v >= MIN_OPENCODE,
             None => false,
         }
     }
@@ -41,21 +41,21 @@ pub fn home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/"))
 }
 
-/// goose's config directory: `GOOSE_PATH_ROOT/config`, else XDG.
+/// OpenCode's config directory: `OPENCODE_CONFIG_DIR`, else XDG.
 pub fn default_config_dir() -> PathBuf {
-    if let Some(root) = env::var_os("GOOSE_PATH_ROOT") {
-        let root = PathBuf::from(root);
-        if root.is_absolute() {
-            return root.join("config");
+    if let Some(dir) = env::var_os("OPENCODE_CONFIG_DIR") {
+        let dir = PathBuf::from(dir);
+        if dir.is_absolute() {
+            return dir;
         }
     }
     if let Some(xdg) = env::var_os("XDG_CONFIG_HOME") {
         let xdg = PathBuf::from(xdg);
         if xdg.is_absolute() {
-            return xdg.join("goose");
+            return xdg.join("opencode");
         }
     }
-    home().join(".config").join("goose")
+    home().join(".config").join("opencode")
 }
 
 pub fn config_dir(override_dir: Option<&Path>) -> PathBuf {
@@ -63,6 +63,12 @@ pub fn config_dir(override_dir: Option<&Path>) -> PathBuf {
         Some(dir) => dir.to_path_buf(),
         None => default_config_dir(),
     }
+}
+
+/// Where a freshly downloaded CLI binary goes when it is not already on PATH.
+/// `~/.local/bin` needs no privileges and is on PATH for most RHEL users.
+pub fn default_install_dir() -> PathBuf {
+    home().join(".local").join("bin")
 }
 
 pub fn os_pretty() -> String {
@@ -77,7 +83,7 @@ pub fn os_pretty() -> String {
     format!("{} {}", env::consts::OS, env::consts::ARCH)
 }
 
-fn find_in_path(name: &str) -> Option<PathBuf> {
+pub fn find_in_path(name: &str) -> Option<PathBuf> {
     let path = env::var_os("PATH")?;
     for dir in env::split_paths(&path) {
         let candidate = dir.join(name);
@@ -88,22 +94,22 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
     None
 }
 
-pub fn goose_info() -> Option<GooseInfo> {
-    let path = find_in_path("goose")?;
+pub fn opencode_info() -> Option<ToolInfo> {
+    let path = find_in_path("opencode")?;
     let output = Command::new(&path).arg("--version").output().ok();
     let raw = output
         .as_ref()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_default();
-    Some(GooseInfo {
+    Some(ToolInfo {
         path,
         version: parse_version(&raw),
         raw_version: raw,
     })
 }
 
-/// Pull the first `x.y.z` token out of `goose 1.38.0` or similar.
+/// Pull the first `x.y.z` token out of `opencode v2.2.5` or similar.
 pub fn parse_version(text: &str) -> Option<(u32, u32, u32)> {
     for token in text.split(|c: char| !(c.is_ascii_digit() || c == '.')) {
         let parts: Vec<&str> = token.split('.').collect();
@@ -194,22 +200,22 @@ mod tests {
 
     #[test]
     fn version_parsing() {
-        assert_eq!(parse_version("goose 1.38.0"), Some((1, 38, 0)));
-        assert_eq!(parse_version("goose-cli 1.45.2-beta"), Some((1, 45, 2)));
-        assert_eq!(parse_version("goose 2.0"), Some((2, 0, 0)));
+        assert_eq!(parse_version("opencode v2.2.5"), Some((2, 2, 5)));
+        assert_eq!(parse_version("2.0.0-beta.1"), Some((2, 0, 0)));
+        assert_eq!(parse_version("opencode 2.0"), Some((2, 0, 0)));
         assert_eq!(parse_version("no version"), None);
     }
 
     #[test]
     fn minimum_version() {
-        let info = GooseInfo {
-            path: PathBuf::from("/usr/bin/goose"),
-            version: Some((1, 38, 0)),
-            raw_version: "goose 1.38.0".into(),
+        let info = ToolInfo {
+            path: PathBuf::from("/usr/local/bin/opencode"),
+            version: Some((2, 2, 5)),
+            raw_version: "opencode v2.2.5".into(),
         };
         assert!(info.meets_min());
-        let old = GooseInfo {
-            version: Some((1, 37, 9)),
+        let old = ToolInfo {
+            version: Some((1, 18, 0)),
             ..info
         };
         assert!(!old.meets_min());

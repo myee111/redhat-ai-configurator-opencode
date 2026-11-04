@@ -14,7 +14,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::OnceLock;
 
-pub const CONFIG_PATH: &str = "/etc/redhat-ai-configurator/endpoints.conf";
+pub const CONFIG_PATH: &str = "/etc/redhat-ai-configurator-opencode/endpoints.conf";
 
 pub const KEYS: [&str; 8] = [
     "RHAI_MAAS_BASE_URL",
@@ -103,21 +103,21 @@ impl Endpoints {
 
     pub fn provider_base(&self, provider: &str) -> &str {
         match provider {
-            "rhai-maas" => &self.rhai_maas_base,
+            "rhai-maas" | "ai-bu" => &self.rhai_maas_base,
             _ => &self.enmaas_base,
         }
     }
 
     pub fn key_page(&self, provider: &str) -> &str {
         match provider {
-            "rhai-maas" => &self.rhai_maas_key_page,
+            "rhai-maas" | "ai-bu" => &self.rhai_maas_key_page,
             _ => &self.enmaas_key_page,
         }
     }
 
     pub fn help(&self, provider: &str) -> &str {
         match provider {
-            "rhai-maas" => &self.rhai_maas_help,
+            "rhai-maas" | "ai-bu" => &self.rhai_maas_help,
             _ => &self.enmaas_help,
         }
     }
@@ -133,16 +133,13 @@ impl Endpoints {
     }
 
     /// True when any of the given providers still points at a placeholder.
-    pub fn uses_placeholders_for<'a>(
-        &self,
-        providers: impl IntoIterator<Item = &'a str>,
-    ) -> bool {
+    pub fn uses_placeholders_for<'a>(&self, providers: impl IntoIterator<Item = &'a str>) -> bool {
         providers
             .into_iter()
             .any(|provider| self.provider_base(provider).contains("example.com"))
     }
 
-    /// Warn when a base URL does not have the shape goose expects. This is a
+    /// Warn when a base URL does not have the shape the installer expects. This is a
     /// warning rather than an error because the value may come from a shared
     /// config file that this run must not break.
     pub fn shape_warning(&self, provider: &str) -> Option<String> {
@@ -152,14 +149,14 @@ impl Endpoints {
         }
         if provider == "rhai-maas" && !base.ends_with("/v1") {
             return Some(format!(
-                "RHAI_MAAS_BASE_URL should include /v1 (currently {base}); goose appends \
-                 /chat/completions to it."
+                "RHAI_MAAS_BASE_URL should include /v1 (currently {base}); OpenCode appends \
+                 /chat/completions to an OpenAI-compatible base."
             ));
         }
         if provider != "rhai-maas" && base.ends_with("/v1") {
             return Some(format!(
-                "ENMAAS_BASE_URL should be the host root without /v1 (currently {base}); goose \
-                 appends v1/messages, which would become v1/v1/messages."
+                "ENMAAS_BASE_URL should be the host root without /v1 (currently {base}); the \
+                 installer appends /v1 itself."
             ));
         }
         None
@@ -239,8 +236,14 @@ mod tests {
     fn defaults_are_placeholders() {
         let endpoints = Endpoints::resolve_with(&BTreeMap::new(), &BTreeMap::new(), None);
         assert!(endpoints.uses_placeholders_for(["rhai-maas", "enmaas"]));
-        assert_eq!(endpoints.provider_base("rhai-maas"), "https://maas.example.com/v1");
-        assert_eq!(endpoints.provider_base("enmaas"), "https://enmaas.example.com");
+        assert_eq!(
+            endpoints.provider_base("rhai-maas"),
+            "https://maas.example.com/v1"
+        );
+        assert_eq!(
+            endpoints.provider_base("enmaas"),
+            "https://enmaas.example.com"
+        );
         assert_eq!(endpoints.eligibility("enmaas"), None);
     }
 

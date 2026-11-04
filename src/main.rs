@@ -1,11 +1,12 @@
+mod agent;
 mod apply;
 mod catalog;
 mod cli;
 mod error;
 mod fsutil;
-mod goose;
 mod keyfile;
 mod netcheck;
+mod opencode;
 mod output;
 mod platform;
 mod settings;

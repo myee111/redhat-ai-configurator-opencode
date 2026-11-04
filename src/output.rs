@@ -18,13 +18,15 @@ pub struct ProviderReport {
 pub struct Report {
     pub ok: bool,
     pub dry_run: bool,
-    pub goose_path: String,
-    pub goose_version: String,
+    pub binary_path: String,
+    pub binary_version: String,
     pub providers: Vec<ProviderReport>,
+    pub agent: String,
     pub config: String,
     pub backup: Option<String>,
-    pub secrets: String,
-    pub secrets_mode: String,
+    /// OpenCode's credential store summary, never a key.
+    pub auth: String,
+    pub auth_updated: bool,
     pub changed: bool,
     pub changed_files: Vec<String>,
     pub verified: Option<bool>,
@@ -39,7 +41,7 @@ impl Report {
         json!({
             "ok": self.ok,
             "dryRun": self.dry_run,
-            "goose": { "path": self.goose_path, "version": self.goose_version },
+            "binary": { "path": self.binary_path, "version": self.binary_version },
             "providers": self.providers.iter().map(|p| json!({
                 "id": p.id,
                 "display": p.display,
@@ -47,10 +49,11 @@ impl Report {
                 "validated": p.validated,
                 "keySource": p.key_source,
             })).collect::<Vec<_>>(),
+            "agent": self.agent,
             "config": self.config,
             "backup": self.backup,
-            "secrets": self.secrets,
-            "secretsMode": self.secrets_mode,
+            "auth": self.auth,
+            "authUpdated": self.auth_updated,
             "changed": self.changed,
             "changedFiles": self.changed_files,
             "verified": self.verified,
@@ -73,25 +76,37 @@ impl Report {
                     println!("  {file}");
                 }
             }
+            if self.auth_updated {
+                println!("Would store the keys in OpenCode's credential store.");
+            }
             print_providers(self);
             print_warnings(self);
             return;
         }
 
-        println!("Configured goose for {} provider(s).", self.providers.len());
+        println!(
+            "Configured OpenCode for {} provider(s).",
+            self.providers.len()
+        );
         print_providers(self);
         println!();
-        println!(
-            "Config    {}",
-            self.config
-        );
+        println!("Config    {}", self.config);
         if let Some(backup) = &self.backup {
             println!("Backup    {backup}");
         }
-        println!("Secrets   {} ({})", self.secrets, self.secrets_mode);
+        println!(
+            "Keys      {} ({})",
+            self.auth,
+            if self.auth_updated {
+                "updated"
+            } else {
+                "unchanged"
+            }
+        );
+        println!("Agent     {}", self.agent);
         match self.verified {
-            Some(true) => println!("Verify    goose info --check: OK"),
-            Some(false) => println!("Verify    goose info --check: FAILED"),
+            Some(true) => println!("Verify    opencode models: OK"),
+            Some(false) => println!("Verify    opencode models: FAILED"),
             None => {}
         }
         if self.verify_output.as_deref().is_some_and(|o| !o.is_empty()) {
@@ -101,7 +116,7 @@ impl Report {
         }
         print_warnings(self);
         println!();
-        println!("Next      run `goose` to start a session.");
+        println!("Next      run `opencode` to start a session.");
     }
 }
 
@@ -113,10 +128,7 @@ fn print_providers(report: &Report) {
             Some(false) => "key not validated",
             None => "validation skipped",
         };
-        println!(
-            "  {} ({})",
-            provider.display, provider.id
-        );
+        println!("  {} ({})", provider.display, provider.id);
         println!("    model   {}", provider.model);
         println!("    key     {status} [{}]", provider.key_source);
     }
@@ -142,7 +154,7 @@ pub fn print_fail(fail: &Fail) {
 /// Printed after the alternate screen closes so it stays in scrollback.
 pub fn print_recap(specs: &[&ProviderSpec], report: &Report) {
     println!();
-    println!("Red Hat AI Configurator");
+    println!("Red Hat AI Configurator for OpenCode");
     for spec in specs {
         println!("  {} - keys: {}", spec.display, spec.key_page());
         println!("    guide: {}", spec.help_url());
@@ -157,5 +169,5 @@ pub fn print_recap(specs: &[&ProviderSpec], report: &Report) {
     if let Some(backup) = &report.backup {
         println!("  backup: {backup}");
     }
-    println!("  start the agent with: goose");
+    println!("  start the agent with: opencode");
 }

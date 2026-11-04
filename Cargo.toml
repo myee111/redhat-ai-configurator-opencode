@@ -1,25 +1,27 @@
 [package]
-name = "redhat-ai-configurator"
-version = "0.1.3"
+name = "redhat-ai-configurator-opencode"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
-description = "Guided installer that configures goose for Red Hat AI MaaS (rhai-maas) and EnMaaS"
-repository = "https://github.com/myee111/redhat-ai-configurator"
+description = "Guided installer that installs and configures OpenCode for Red Hat AI MaaS (rhai-maas) and EnMaaS"
+repository = "https://github.com/myee111/redhat-ai-configurator-opencode"
 
 [[bin]]
-name = "redhat-ai-configurator"
+name = "redhat-ai-configurator-opencode"
 path = "src/main.rs"
 
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4.5", features = ["derive"] }
 crossterm = "0.29"
+flate2 = "1"
+jsonc-parser = { version = "0.26", features = ["serde"] }
 libc = "0.2"
 ratatui = "0.30"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml_ng = "0.10"
+tar = "0.4"
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 
 [dev-dependencies]

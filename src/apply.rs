@@ -1,26 +1,28 @@
 //! The shared plan/apply core used by both the TUI and non-interactive mode.
 
-use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
+use crate::agent::Agent;
 use crate::catalog::{self, ProviderSpec};
 use crate::error::{Fail, Result, code};
 use crate::fsutil;
-use crate::goose::config::{self, GooseMode, ProviderEntry, RenderInput};
-use crate::goose::{providers, secrets};
-use crate::platform;
+use crate::opencode::auth;
+use crate::opencode::config::{self, RenderInput};
+use crate::opencode::{install, providers};
 
 #[derive(Clone, Debug)]
 pub struct Selection {
     pub provider_ids: Vec<&'static str>,
     /// provider id -> model name
     pub model_overrides: Vec<(String, String)>,
-    pub mode: GooseMode,
-    pub secrets_mode: secrets::SecretsMode,
+    pub agent: Agent,
     /// secret name -> key value
     pub keys: Vec<(String, String)>,
     pub keep_existing: bool,
     pub config_dir: PathBuf,
+    /// OpenCode CLI used for its credential store and verification.
+    pub opencode: PathBuf,
 }
 
 #[derive(Clone, Debug)]
@@ -34,13 +36,14 @@ pub struct FileOp {
 pub struct Plan {
     pub ops: Vec<FileOp>,
     pub config_path: PathBuf,
-    pub secrets_path: PathBuf,
     pub models: Vec<(String, String)>,
-    pub secrets_mode: secrets::SecretsMode,
-    pub secret_updates: Vec<secrets::Update>,
+    pub model_refs: Vec<String>,
+    pub agent: Agent,
+    pub auth_updates: Vec<auth::Update>,
+    pub auth_stored: BTreeMap<String, auth::Credential>,
+    pub auth_changed: bool,
     pub warnings: Vec<String>,
     pub changed: Vec<PathBuf>,
-    pub secrets_changed: bool,
     pub existing_keys: BTreeSet<String>,
 }
 
@@ -57,7 +60,8 @@ pub struct Commit {
 }
 
 impl Commit {
-    /// Put every backed-up file back where it came from.
+    /// Put every backed-up file back where it came from. Accounts already
+    /// imported into OpenCode's database stay there.
     pub fn restore(&self) {
         for backup in self.backups.iter().rev() {
             let _ = std::fs::copy(&backup.path, &backup.original);
@@ -71,12 +75,15 @@ fn model_for(sel: &Selection, spec: &ProviderSpec) -> (String, String) {
         .iter()
         .find(|(provider, _)| provider == spec.id)
     {
-        let declarative = catalog::resolve_model(spec, model)
+        let provider = catalog::resolve_model(spec, model)
             .map(|(d, _)| d.name)
             .unwrap_or(spec.default_provider);
-        return (declarative.to_string(), model.clone());
+        return (provider.to_string(), model.clone());
     }
-    (spec.default_provider.to_string(), spec.default_model.to_string())
+    (
+        spec.default_provider.to_string(),
+        spec.default_model.to_string(),
+    )
 }
 
 pub fn build(sel: &Selection) -> Result<Plan> {
@@ -84,48 +91,41 @@ pub fn build(sel: &Selection) -> Result<Plan> {
         return Err(Fail::new(code::USAGE, "Choose at least one provider."));
     }
 
-    let mut providers: Vec<&'static ProviderSpec> = Vec::new();
+    let mut selected: Vec<&'static ProviderSpec> = Vec::new();
     for id in &sel.provider_ids {
         let spec = catalog::find(id)
             .ok_or_else(|| Fail::new(code::USAGE, format!("Unknown provider: {id}")))?;
-        if !providers.iter().any(|p| p.id == spec.id) {
-            providers.push(spec);
+        if !selected.iter().any(|p| p.id == spec.id) {
+            selected.push(spec);
         }
     }
 
     let mut warnings = Vec::new();
-    let mut secrets_mode = sel.secrets_mode;
-    if secrets_mode == secrets::SecretsMode::Keyring && !secrets::keyring_available() {
-        warnings.push(
-            "The system keyring is not reachable, so keys will be stored in secrets.yaml (0600)."
-                .to_string(),
-        );
-        secrets_mode = secrets::SecretsMode::File;
-    }
-
-    let existing_keys = secrets::existing_names(&sel.config_dir);
+    let stored = auth::stored(&sel.opencode);
+    let existing_keys: BTreeSet<String> = stored
+        .iter()
+        .filter(|(_, credential)| !credential.key.is_empty())
+        .map(|(integration, _)| integration.clone())
+        .collect();
 
     let mut secret_updates = Vec::new();
     let mut models = Vec::new();
-    let mut configured: Vec<ProviderEntry> = Vec::new();
-    let mut active: Option<ProviderEntry> = None;
+    let mut model_refs = Vec::new();
+    let mut entries = Vec::new();
+    let mut written = BTreeSet::new();
 
-    for spec in &providers {
-        let (declarative, model) = model_for(sel, spec);
+    for spec in &selected {
+        let (provider, model) = model_for(sel, spec);
         models.push((spec.id.to_string(), model.clone()));
-        if !configured.iter().any(|entry| entry.name == declarative) {
-            configured.push(ProviderEntry {
-                name: declarative.clone(),
-                model: model.clone(),
-            });
-        }
-        if active.is_none() {
-            active = Some(ProviderEntry {
-                name: declarative.clone(),
-                model: model.clone(),
-            });
+        model_refs.push(catalog::model_ref(&provider, &model));
+
+        for declarative in spec.declaratives {
+            if written.insert(declarative.name) {
+                entries.push(providers::entry(declarative));
+            }
         }
 
+        let integration = spec.default_provider;
         let provided = sel
             .keys
             .iter()
@@ -133,12 +133,15 @@ pub fn build(sel: &Selection) -> Result<Plan> {
             .map(|(_, value)| value.clone());
 
         match provided {
-            Some(value) => secret_updates.push(secrets::Update {
-                name: spec.secret.to_string(),
-                value,
+            Some(value) => secret_updates.push(auth::Update {
+                integration: integration.to_string(),
+                key: value,
             }),
             None => {
-                if !(sel.keep_existing && existing_keys.contains(spec.secret)) {
+                let already_stored = stored
+                    .get(integration)
+                    .is_some_and(|credential| !credential.key.is_empty());
+                if !(sel.keep_existing && already_stored) {
                     let mut fail = Fail::new(
                         code::KEY,
                         format!("No API key supplied for {}.", spec.display),
@@ -154,88 +157,78 @@ pub fn build(sel: &Selection) -> Result<Plan> {
         }
     }
 
-    let active = active.expect("at least one provider");
+    // EnMaaS wins when both are configured, so DeepSeek 4.1 Flash is the
+    // default. Ties fall back to the order the user selected.
+    let active_spec = selected
+        .iter()
+        .min_by_key(|spec| spec.priority)
+        .copied()
+        .expect("at least one provider");
+    let (active_provider, active_model) = model_for(sel, active_spec);
 
-    let config_path = sel.config_dir.join("config.yaml");
+    let config_path = config_path(&sel.config_dir);
     let existing_config = std::fs::read_to_string(&config_path).unwrap_or_default();
     let config_body = config::render(
         &existing_config,
         &RenderInput {
-            active: active.clone(),
-            configured: configured.clone(),
-            mode: sel.mode,
-            disable_keyring: Some(secrets_mode == secrets::SecretsMode::File),
+            active: (active_provider, active_model),
+            entries,
+            agent: sel.agent.as_str().to_string(),
         },
     )?;
 
-    let mut ops = Vec::new();
-    let mut written = BTreeSet::new();
-    for spec in &providers {
-        for declarative in spec.declaratives {
-            if !written.insert(declarative.name) {
-                continue;
-            }
-            ops.push(FileOp {
-                path: sel
-                    .config_dir
-                    .join("custom_providers")
-                    .join(providers::file_name(declarative)),
-                contents: providers::render(declarative, &declarative.base_url()),
-                mode: 0o644,
-            });
-        }
-    }
-
-    ops.push(FileOp {
+    let ops = vec![FileOp {
         path: config_path.clone(),
         contents: config_body,
-        mode: existing_mode(&config_path).unwrap_or(0o644),
-    });
+        mode: existing_mode(&config_path).unwrap_or(0o600),
+    }];
 
-    let mut changed = Vec::new();
-    for op in &ops {
-        match std::fs::read_to_string(&op.path) {
-            Ok(current) if current == op.contents => {}
-            _ => changed.push(op.path.clone()),
-        }
+    let changed: Vec<PathBuf> = ops
+        .iter()
+        .filter(|op| match std::fs::read_to_string(&op.path) {
+            Ok(current) => current != op.contents,
+            Err(_) => true,
+        })
+        .map(|op| op.path.clone())
+        .collect();
+
+    if sel.agent == Agent::Plan && selected.iter().all(|spec| spec.id != "enmaas") {
+        warnings.push(
+            "Plan is read-only; the agent will not edit files with this default.".to_string(),
+        );
     }
 
-    let secrets_path = secrets::file_path(&sel.config_dir);
-    let mut secrets_changed = false;
-    if !secret_updates.is_empty() {
-        let current = secrets::read_file(&secrets_path);
-        secrets_changed = secret_updates
-            .iter()
-            .any(|update| current.get(&update.name) != Some(&update.value));
-        if secrets_changed && secrets_mode == secrets::SecretsMode::File {
-            changed.push(secrets_path.clone());
-        }
-    }
+    let auth_changed = !secret_updates.is_empty() && !auth::matches(&stored, &secret_updates);
 
     Ok(Plan {
         ops,
         config_path,
-        secrets_path,
         models,
-        secrets_mode,
-        secret_updates,
+        model_refs,
+        agent: sel.agent,
+        auth_updates: secret_updates,
+        auth_stored: stored,
+        auth_changed,
         warnings,
         changed,
-        secrets_changed,
         existing_keys,
     })
 }
 
-fn existing_mode(path: &std::path::Path) -> Option<u32> {
+pub fn config_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("opencode.json")
+}
+
+fn existing_mode(path: &Path) -> Option<u32> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path)
         .ok()
         .map(|meta| meta.permissions().mode() & 0o7777)
 }
 
-pub fn commit(plan: &Plan, rollback_on_failure: bool) -> Result<Commit> {
+pub fn commit(plan: &Plan, opencode: &Path, rollback_on_failure: bool) -> Result<Commit> {
     let mut backups: Vec<Backup> = Vec::new();
-    let mut warnings = plan.warnings.clone();
+    let warnings = plan.warnings.clone();
 
     let result = (|| -> Result<()> {
         for op in &plan.ops {
@@ -264,33 +257,8 @@ pub fn commit(plan: &Plan, rollback_on_failure: bool) -> Result<Commit> {
             })?;
         }
 
-        if !plan.secret_updates.is_empty() && plan.secrets_changed {
-            match plan.secrets_mode {
-                secrets::SecretsMode::File => {
-                    if plan.secrets_path.exists()
-                        && let Some(backup) = fsutil::backup(&plan.secrets_path).map_err(|error| {
-                            Fail::new(
-                                code::WRITE,
-                                format!("Could not back up secrets.yaml: {error}"),
-                            )
-                        })?
-                    {
-                        backups.push(Backup {
-                            path: backup,
-                            original: plan.secrets_path.clone(),
-                        });
-                    }
-                    secrets::apply_file(&plan.secrets_path, &plan.secret_updates)?;
-                }
-                secrets::SecretsMode::Keyring => {
-                    if let Err(error) = secrets::apply_keyring(&plan.secret_updates) {
-                        warnings.push(format!(
-                            "Could not store the key in the keyring ({error}); falling back to secrets.yaml."
-                        ));
-                        secrets::apply_file(&plan.secrets_path, &plan.secret_updates)?;
-                    }
-                }
-            }
+        if plan.auth_changed {
+            auth::import(opencode, &plan.auth_stored, &plan.auth_updates)?;
         }
         Ok(())
     })();
@@ -304,32 +272,77 @@ pub fn commit(plan: &Plan, rollback_on_failure: bool) -> Result<Commit> {
         return Err(error);
     }
 
-    Ok(Commit {
-        backups,
-        warnings,
-    })
+    Ok(Commit { backups, warnings })
 }
 
-pub fn preflight_goose() -> Result<platform::GooseInfo> {
-    let info = platform::goose_info().ok_or_else(|| {
-        Fail::new(code::GOOSE, "goose is not installed.")
-            .hint("sudo subscription-manager repos --enable=rhel-10-for-$(arch)-extensions-rpms")
-            .hint("sudo dnf install goose")
-    })?;
-    if !info.meets_min() {
-        return Err(Fail::new(
-            code::GOOSE,
-            format!(
-                "goose {} is older than the required {}.",
-                info.version_string(),
-                version_text(platform::MIN_GOOSE)
-            ),
-        )
-        .hint("sudo dnf upgrade goose"));
+/// Make sure the CLI is present before the TUI or non-interactive run starts.
+pub fn preflight(install_dir: Option<&Path>, allow_install: bool) -> Result<install::Outcome> {
+    let outcome = install::ensure(install_dir, allow_install)?;
+    if outcome.installed_now {
+        eprintln!(
+            "Installed OpenCode {} at {}",
+            outcome.info.version_string(),
+            outcome.info.path.display()
+        );
     }
-    Ok(info)
+    for warning in &outcome.warnings {
+        eprintln!("warning: {warning}");
+    }
+    Ok(outcome)
 }
 
-fn version_text((a, b, c): (u32, u32, u32)) -> String {
-    format!("{a}.{b}.{c}")
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn selection(dir: &Path) -> Selection {
+        Selection {
+            provider_ids: vec!["rhai-maas", "enmaas"],
+            model_overrides: Vec::new(),
+            agent: Agent::Build,
+            keys: vec![
+                ("RHAI_MAAS_API_KEY".into(), "one".into()),
+                ("ENMAAS_API_KEY".into(), "two".into()),
+            ],
+            keep_existing: false,
+            config_dir: dir.to_path_buf(),
+            opencode: PathBuf::from("/bin/true"),
+        }
+    }
+
+    #[test]
+    fn enmaas_is_the_active_provider_when_both_are_selected() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = build(&selection(dir.path())).unwrap();
+        let model = plan
+            .ops
+            .iter()
+            .find(|op| op.path.ends_with("opencode.json"))
+            .map(|op| op.contents.clone())
+            .unwrap();
+        assert!(model.contains("\"model\": \"enmaas/rits/deepseek-ai/DeepSeek-V4.1-Flash-1017\""));
+        assert!(model.contains("\"default_agent\": \"build\""));
+    }
+
+    #[test]
+    fn missing_key_is_a_key_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sel = selection(dir.path());
+        sel.keys.clear();
+        let error = build(&sel).unwrap_err();
+        assert_eq!(error.code, code::KEY);
+    }
+
+    #[test]
+    fn key_updates_replace_the_credential_per_integration() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = build(&selection(dir.path())).unwrap();
+        let integrations: Vec<&str> = plan
+            .auth_updates
+            .iter()
+            .map(|update| update.integration.as_str())
+            .collect();
+        assert_eq!(integrations, vec!["ai-bu", "enmaas"]);
+        assert!(plan.auth_changed);
+    }
 }
