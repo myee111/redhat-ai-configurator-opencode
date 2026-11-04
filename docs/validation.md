@@ -47,6 +47,21 @@ The TUI is not usable without a window size: over a non-tty `ssh -tt` the PTY
 reports 0x0 and the alternate screen stays blank. Run it from a real terminal
 (or set `stty rows/cols` first).
 
+## RPM
+
+Built from the committed tree on a RHEL 10.2 x86_64 host with `make rpm`:
+
+- `dist/redhat-ai-configurator-opencode-0.1.0-1.el10.x86_64.rpm` (1.4 MB)
+- `dist/redhat-ai-configurator-opencode-0.1.0-1.el10.src.rpm` (40 MB, vendors
+  the crates so it builds offline)
+
+The binary RPM was installed with `rpm -ivh` on a fresh RHEL 10.2 instance. It
+provided `/usr/bin/redhat-ai-configurator-opencode`, the man page, the license
+and the endpoints example; the installed binary then completed the full
+install-configure-verify flow and `opencode models` listed 30 models.
+
+`dist/` and `*.rpm` are gitignored, so the artifacts stay local.
+
 ## Reproduce
 
 ```sh
